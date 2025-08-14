@@ -3,7 +3,7 @@
 #include <cmath>
 
 // FloatingPointExtractor  (Stage 1)
-SC_MODULE(FloatingPointExtractor) {
+SC_MODULE(FloatingPointExtractor1) {
     sc_in<sc_uint<32>> in;
     sc_in<bool> reset;
     sc_out<bool> sign;
@@ -50,7 +50,7 @@ SC_MODULE(FloatingPointExtractor) {
         }
     }
 
-    SC_CTOR(FloatingPointExtractor) {
+    SC_CTOR(FloatingPointExtractor1) {
         SC_METHOD(extract);
         sensitive << in << reset;
     }
@@ -223,8 +223,8 @@ SC_MODULE(FloatingPointAdder) {
     }
 };
 
-// FloatingPointNormalizer - Stage 3 (Modified for addition)
-SC_MODULE(FloatingPointNormalizer) {
+// FloatingPointNormalizer - Stage 3
+SC_MODULE(FloatingPointNormalizer1) {
     sc_in<sc_uint<25>> Result_Mantissa;
     sc_in<sc_uint<8>> Result_Exponent;
     sc_in<bool> Result_Sign;
@@ -337,12 +337,15 @@ SC_MODULE(FloatingPointNormalizer) {
         }
     }
 
-    SC_CTOR(FloatingPointNormalizer) {
+    SC_CTOR(FloatingPointNormalizer1) {
         SC_METHOD(normalize);
         sensitive << Result_Mantissa << Result_Exponent << Result_Sign 
                  << result_is_nan << result_is_inf << result_is_zero << reset;
     }
 };
+
+
+
 
 // Pipelined top-level adder
 SC_MODULE(ieee754add) {
@@ -383,10 +386,10 @@ SC_MODULE(ieee754add) {
     sc_signal<bool> valid_stage1, valid_stage2, valid_stage3;
 
     // Submodule instances
-    FloatingPointExtractor extractA;
-    FloatingPointExtractor extractB;
+    FloatingPointExtractor1 extractA;
+    FloatingPointExtractor1 extractB;
     FloatingPointAdder add;
-    FloatingPointNormalizer normalize;
+    FloatingPointNormalizer1 normalize;
 
     SC_CTOR(ieee754add) : 
         extractA("extractA"), extractB("extractB"), 
