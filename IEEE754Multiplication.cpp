@@ -1,3 +1,12 @@
+
+#include <systemc.h>
+#include <cmath>
+#include <vector>
+#include <iomanip>
+#include <string>
+#include <cstring>
+
+
 SC_MODULE(FloatingPointExtractor) {
     sc_in<sc_uint<32>> in;
     sc_in<bool> reset;
@@ -438,4 +447,3 @@ SC_MODULE(ieee754mult) {
         }
     }
 };
-#include 
