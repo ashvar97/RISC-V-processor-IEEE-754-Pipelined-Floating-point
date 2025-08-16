@@ -1,9 +1,15 @@
-
 #include <systemc.h>
 #include <cmath>
+#include <vector>
+#include <iomanip>
+#include <string>
+#include <cstring>
+#include <limits>
 
-// FloatingPointExtractor  (Stage 1)
-SC_MODULE(FloatingPointExtractor1) {
+using namespace std;
+
+// FloatingPointExtractor - Stage 1 (same as multiplier/subtractor)
+SC_MODULE(FloatingPointExtractor) {
     sc_in<sc_uint<32>> in;
     sc_in<bool> reset;
     sc_out<bool> sign;
@@ -50,7 +56,7 @@ SC_MODULE(FloatingPointExtractor1) {
         }
     }
 
-    SC_CTOR(FloatingPointExtractor1) {
+    SC_CTOR(FloatingPointExtractor) {
         SC_METHOD(extract);
         sensitive << in << reset;
     }
@@ -121,7 +127,7 @@ SC_MODULE(FloatingPointAdder) {
                 result_is_zero.write(true);
                 Result_Mantissa.write(0);
                 Result_Exponent.write(0);
-                Result_Sign.write(A_sign.read() && B_sign.read()); // -0 only if both are -0
+                Result_Sign.write(A_sign.read() && B_sign.read()); // Both negative -> negative zero
                 return;
             } else if (A_is_zero.read()) {
                 result_is_nan.write(false);
@@ -181,7 +187,7 @@ SC_MODULE(FloatingPointAdder) {
                 }
             }
             
-            // Perform addition or subtraction
+            // Perform addition or subtraction based on sign
             sc_uint<25> result_mant;
             bool result_sign;
             
@@ -223,8 +229,8 @@ SC_MODULE(FloatingPointAdder) {
     }
 };
 
-// FloatingPointNormalizer - Stage 3
-SC_MODULE(FloatingPointNormalizer1) {
+// FloatingPointNormalizer - Stage 3 (same as multiplier/subtractor)
+SC_MODULE(FloatingPointNormalizer) {
     sc_in<sc_uint<25>> Result_Mantissa;
     sc_in<sc_uint<8>> Result_Exponent;
     sc_in<bool> Result_Sign;
@@ -268,7 +274,7 @@ SC_MODULE(FloatingPointNormalizer1) {
             
             // Normal case normalization
             sc_uint<25> temp_mant = Result_Mantissa.read();
-            sc_int<10> temp_exp = (sc_int<10>)Result_Exponent.read(); // Use signed for proper underflow handling
+            sc_int<10> temp_exp = (sc_int<10>)Result_Exponent.read();
             
             // Handle zero result
             if (temp_mant == 0) {
@@ -337,22 +343,20 @@ SC_MODULE(FloatingPointNormalizer1) {
         }
     }
 
-    SC_CTOR(FloatingPointNormalizer1) {
+    SC_CTOR(FloatingPointNormalizer) {
         SC_METHOD(normalize);
         sensitive << Result_Mantissa << Result_Exponent << Result_Sign 
                  << result_is_nan << result_is_inf << result_is_zero << reset;
     }
 };
 
-
-
-
 // Pipelined top-level adder
-SC_MODULE(ieee754add) {
+SC_MODULE(ieee754_adder_pipelined) {
     sc_in<sc_uint<32>> A;
     sc_in<sc_uint<32>> B;
     sc_in<bool> reset;
     sc_in<bool> clk;
+    sc_in<bool> valid_in;
     sc_out<sc_uint<32>> result;
     sc_out<bool> valid_out;
     sc_out<bool> overflow;
@@ -386,12 +390,12 @@ SC_MODULE(ieee754add) {
     sc_signal<bool> valid_stage1, valid_stage2, valid_stage3;
 
     // Submodule instances
-    FloatingPointExtractor1 extractA;
-    FloatingPointExtractor1 extractB;
+    FloatingPointExtractor extractA;
+    FloatingPointExtractor extractB;
     FloatingPointAdder add;
-    FloatingPointNormalizer1 normalize;
+    FloatingPointNormalizer normalize;
 
-    SC_CTOR(ieee754add) : 
+    SC_CTOR(ieee754_adder_pipelined) : 
         extractA("extractA"), extractB("extractB"), 
         add("add"), normalize("normalize") 
     {
@@ -513,7 +517,7 @@ SC_MODULE(ieee754add) {
             result_is_zero_reg = result_is_zero_comb.read();
             
             // Update valid signals (pipeline progression)
-            valid_stage1 = true;
+            valid_stage1 = valid_in.read();
             valid_stage2 = valid_stage1;
             valid_stage3 = valid_stage2;
             valid_out = valid_stage3;  // Result is valid after 3 clock cycles
@@ -522,3 +526,4 @@ SC_MODULE(ieee754add) {
         }
     }
 };
+
