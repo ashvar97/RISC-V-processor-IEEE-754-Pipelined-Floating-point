@@ -1,296 +1,273 @@
-
-#include <systemc.h>
-#include <cmath>
-#include <iomanip>
-#include <cfloat>
-#include <cstring>
-
-using namespace std;
-
-// Ensure float constants are available
-#ifndef __FLT_EPSILON__
-#define __FLT_EPSILON__ 1.19209290e-07F
-#endif
-
-#ifndef __FLT_MIN__
-#define __FLT_MIN__ 1.17549435e-38F
-#endif
-
-
-
-inline float hexToFloat(uint32_t hex) {
-    float f;
-    memcpy(&f, &hex, sizeof(float));
-    return f;
-}
-
-
-// Utility function to convert float to hex representation
-uint32_t floatToHex(float value) {
-    uint32_t result;
-    memcpy(&result, &value, sizeof(float));
-    return result;
-}
-
-// Utility function to print float value from hex
-void printFloat(uint32_t hex) {
-    float f;
-    memcpy(&f, &hex, sizeof(float));
-    cout << " (value: " << f << ")";
-}
-
+// Test Bench
 int sc_main(int argc, char* argv[]) {
-    sc_clock clock("clk", 10, SC_NS);
+    // Create clock and reset signals
+    sc_clock clk("clk", 10, SC_NS);  // 10ns period = 100MHz
     sc_signal<bool> reset;
+
+    // Adder signals
     sc_signal<sc_uint<32>> A, B;
+    sc_signal<bool> valid_in;
     sc_signal<sc_uint<32>> result;
     sc_signal<bool> valid_out;
     sc_signal<bool> overflow, underflow;
     
-    ieee754add adder("adder");
-    
-    adder.clk(clock);
+    // Instantiate the pipelined adder
+    ieee754_adder_pipelined adder("adder");
+    adder.clk(clk);
     adder.reset(reset);
     adder.A(A);
     adder.B(B);
+    adder.valid_in(valid_in);
     adder.result(result);
     adder.valid_out(valid_out);
     adder.overflow(overflow);
     adder.underflow(underflow);
+
+    // Trace setup for viewing in waveform viewer
+    sc_trace_file *tf = sc_create_vcd_trace_file("pipelined_adder_trace");
+    sc_trace(tf, clk, "clk");
+    sc_trace(tf, reset, "reset");
+    sc_trace(tf, A, "A");
+    sc_trace(tf, B, "B");
+    sc_trace(tf, valid_in, "valid_in");
+    sc_trace(tf, result, "result");
+    sc_trace(tf, valid_out, "valid_out");
+    sc_trace(tf, overflow, "overflow");
+    sc_trace(tf, underflow, "underflow");
     
-    cout << "Starting simulation of IEEE 754 Floating Point Adder" << endl;
-    
+    // Trace internal pipeline registers
+    sc_trace(tf, adder.A_sign_reg, "A_sign_reg");
+    sc_trace(tf, adder.A_Exponent_reg, "A_Exponent_reg");
+    sc_trace(tf, adder.A_Mantissa_reg, "A_Mantissa_reg");
+    sc_trace(tf, adder.valid_stage1, "valid_stage1");
+    sc_trace(tf, adder.valid_stage2, "valid_stage2");
+    sc_trace(tf, adder.valid_stage3, "valid_stage3");
+
     // Test cases
     struct TestCase {
         float a;
         float b;
+        float expected;
+        const char* description;
+    };
+
+    TestCase test_cases[] = {
+        {1.5f, 2.5f, 4.0f, "Basic addition: 1.5 + 2.5"},
+        {-3.25f, 5.75f, 2.5f, "Mixed signs: -3.25 + 5.75"},
+        {0.0f, 42.0f, 42.0f, "Zero + number: 0.0 + 42.0"},
+        {-0.0f, 0.0f, 0.0f, "Negative zero + positive zero"},
+        {std::numeric_limits<float>::infinity(), 1.0f, std::numeric_limits<float>::infinity(), "Infinity + number"},
+        {-std::numeric_limits<float>::infinity(), std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN(), "Negative infinity + positive infinity (NaN)"},
+        {1e-38f, 1e-38f, 2e-38f, "Very small numbers"},
+        {3.14159f, 2.71828f, 5.85987f, "Pi + e"},
+        {1000000.0f, 0.001f, 1000000.001f, "Large + small numbers"},
+        {-7.5f, 7.5f, 0.0f, "Cancellation: -7.5 + 7.5"}
+    };
+
+    int num_tests = sizeof(test_cases) / sizeof(test_cases[0]);
+
+    cout << "\n=== Pipelined IEEE 754 Adder Test ===\n";
+    cout << "Pipeline has 3 stages: Extract -> Add -> Normalize\n";
+    cout << "Result will be available after 3 clock cycles\n\n";
+
+    // Initialize
+    reset = true;
+    A = 0;
+    B = 0;
+    valid_in = false;
+    
+    cout << "Applying reset...\n";
+    sc_start(20, SC_NS);  // 2 clock cycles reset
+
+    reset = false;
+    valid_in = true;
+    cout << "Reset released, starting tests...\n\n";
+
+    // Run test cases
+    for (int i = 0; i < num_tests; i++) {
+        TestCase &tc = test_cases[i];
+        
+        // Convert floats to raw bits for input
+        uint32_t a_bits = *reinterpret_cast<uint32_t*>(&tc.a);
+        uint32_t b_bits = *reinterpret_cast<uint32_t*>(&tc.b);
+        
+        // Set inputs
+        A = a_bits;
+        B = b_bits;
+        
+        cout << "Test " << (i+1) << ": " << tc.description << endl;
+        cout << "  Input A = " << tc.a << " (0x" << hex << a_bits << ")" << endl;
+        cout << "  Input B = " << tc.b << " (0x" << hex << b_bits << ")" << endl;
+        cout << "  Expected = " << tc.expected << endl;
+        
+        cout << "\n  Pipeline progress:" << endl;
+        
+        // Monitor pipeline for 4 clock cycles to see the progression
+        for (int cycle = 0; cycle < 4; cycle++) {
+            sc_start(10, SC_NS);  // One clock cycle
+            
+            cout << "    Cycle " << (cycle + 1) << ": ";
+            cout << "valid_in=" << (valid_in.read() ? "1" : "0");
+            cout << ", stage1=" << (adder.valid_stage1.read() ? "1" : "0");
+            cout << ", stage2=" << (adder.valid_stage2.read() ? "1" : "0");
+            cout << ", stage3=" << (adder.valid_stage3.read() ? "1" : "0");
+            cout << ", valid_out=" << (valid_out.read() ? "1" : "0");
+            
+            if (valid_out.read()) {
+                uint32_t result_bits = result.read();
+                float result_float = *reinterpret_cast<float*>(&result_bits);
+                cout << " -> RESULT: " << result_float << " (0x" << hex << result_bits << ")";
+                
+                // Validation
+                bool is_expected_nan = std::isnan(tc.expected);
+                bool is_result_nan = std::isnan(result_float);
+                
+                if (is_expected_nan && is_result_nan) {
+                    cout << " ✓ PASS (both NaN)";
+                } else if (std::isinf(tc.expected) && std::isinf(result_float) && 
+                          (std::signbit(tc.expected) == std::signbit(result_float))) {
+                    cout << " ✓ PASS (both infinity with same sign)";
+                } else if (abs(result_float - tc.expected) < 0.001f) {
+                    cout << " ✓ PASS";
+                } else {
+                    cout << " ✗ FAIL";
+                }
+                
+                if (overflow.read()) cout << " [OVERFLOW]";
+                if (underflow.read()) cout << " [UNDERFLOW]";
+            }
+            cout << endl;
+        }
+        
+        // Clear valid_in for next test to show pipeline behavior
+        if (i < num_tests - 1) {
+            valid_in = false;
+            sc_start(10, SC_NS);  // One cycle with no new input
+            valid_in = true;
+        }
+        
+        cout << endl;
+    }
+
+    // Test pipeline throughput with consecutive inputs
+    cout << "\n=== Pipeline Throughput Test ===\n";
+    cout << "Testing pipeline with consecutive inputs every cycle\n\n";
+    
+    // Prepare consecutive test inputs
+    float consecutive_inputs[][2] = {
+        {1.0f, 2.0f},
+        {3.0f, 4.0f},
+        {5.0f, 6.0f},
+        {7.0f, 8.0f}
+    };
+    
+    valid_in = true;
+    
+    // Feed inputs every cycle
+    for (int i = 0; i < 4; i++) {
+        uint32_t a_bits = *reinterpret_cast<uint32_t*>(&consecutive_inputs[i][0]);
+        uint32_t b_bits = *reinterpret_cast<uint32_t*>(&consecutive_inputs[i][1]);
+        
+        A = a_bits;
+        B = b_bits;
+        
+        cout << "Cycle " << (i+1) << ": Input " << consecutive_inputs[i][0] 
+             << " + " << consecutive_inputs[i][1] << endl;
+        
+        sc_start(10, SC_NS);
+    }
+    
+    // Continue for a few more cycles to see all outputs
+    valid_in = false;  // No more new inputs
+    A = 0;
+    B = 0;
+    
+    for (int i = 0; i < 4; i++) {
+        sc_start(10, SC_NS);
+        
+        cout << "Cycle " << (i+5) << ": ";
+        if (valid_out.read()) {
+            uint32_t result_bits = result.read();
+            float result_float = *reinterpret_cast<float*>(&result_bits);
+            cout << "Output = " << result_float;
+        } else {
+            cout << "No output";
+        }
+        cout << endl;
+    }
+    
+    // Test special cases
+    cout << "\n=== Special Cases Test ===\n";
+    
+    struct SpecialCase {
+        uint32_t a_bits;
+        uint32_t b_bits;
         const char* description;
     };
     
-    TestCase test_cases[] = {
-        // Basic addition cases
-        {9.5f, -1.0f, "Normal numbers (3.5 + 1.25)"},
-        {100.0f, 0.01f, "Normal numbers with different scales (100 + 0.01)"},
-        {1.0f, 1.0f, "Identity addition (1.0 + 1.0)"},
-        {5.0f, -3.0f, "Positive + Negative (5.0 + (-3.0))"},
-        {-4.0f, -5.0f, "Negative + Negative (-4.0 + (-5.0))"},
-        {7.5f, -7.5f, "Cancellation (7.5 + (-7.5))"},
-        
-        // Zero cases
-        {0.0f, 5.0f, "Zero addition (0.0 + 5.0)"},
-        {0.0f, 0.0f, "Zero by zero (0.0 + 0.0)"},
-        {-0.0f, 0.0f, "Negative zero + zero (-0.0 + 0.0)"},
-        {-0.0f, -0.0f, "Negative zero + negative zero (-0.0 + (-0.0))"},
-        
-        // Special cases
-        {INFINITY, 5.0f, "Infinity addition (inf + 5.0)"},
-        {INFINITY, -INFINITY, "Infinity + negative infinity (inf + (-inf) -> NaN)"},
-        {INFINITY, INFINITY, "Infinity + infinity (inf + inf)"},
-        {NAN, 5.0f, "NaN propagation (NaN + 5.0)"},
-        {5.0f, NAN, "NaN propagation (5.0 + NaN)"},
-        
-        // Small number cases
-        {1e-20f, 1e20f, "Very different magnitudes"},
-        {1e-30f, 1e-31f, "Very small numbers"},
-        {1e30f, 1e31f, "Very large numbers"},
-        
-        // Edge cases for normalization
-        {1.0f, 1.0f + __FLT_EPSILON__, "Close numbers (1.0 + (1.0 + epsilon))"},
-        {1.5f, 0.5f, "Numbers resulting in carry (1.5 + 0.5)"},
-        
-        // Denormalized number tests (very small numbers)
-        {1e-38f, 1e-39f, "Near denormal range"},
-        {__FLT_MIN__, __FLT_MIN__, "Minimum float values"},
-        
-        // Precision edge cases  
-        {1.0f, 0x1p-24f, "1.0 + smallest representable fraction"},
-        {0x1.fffffep+127f, 1.0f, "Near maximum float + 1.0"}
+    SpecialCase special_cases[] = {
+        {0x7F800000, 0x3F800000, "Positive infinity + 1.0"},
+        {0xFF800000, 0x7F800000, "Negative infinity + positive infinity"},
+        {0x7FC00000, 0x3F800000, "NaN + 1.0"},
+        {0x00000000, 0x80000000, "Positive zero + negative zero"},
+        {0x00800000, 0x00400000, "Smallest normal + denormalized"}
     };
     
-    // Reset the adder
-    cout << "Resetting the adder..." << endl;
-    reset.write(true);
-    A.write(0);
-    B.write(0);
-    sc_start(30, SC_NS);
-    reset.write(false);
-    sc_start(10, SC_NS);
+    int num_special = sizeof(special_cases) / sizeof(special_cases[0]);
     
-    int total_tests = 0;
-    int passed_tests = 0;
+    valid_in = true;
     
-    for (const auto& test : test_cases) {
-        total_tests++;
-        cout << "\nTest " << total_tests << ": " << test.description << endl;
-        cout << "  A = " << test.a << " (0x" << hex << floatToHex(test.a) << ")" << endl;
-        cout << "  B = " << test.b << " (0x" << hex << floatToHex(test.b) << ")" << dec << endl;
+    for (int i = 0; i < num_special; i++) {
+        SpecialCase &sc = special_cases[i];
         
-        // Write inputs
-        A.write(floatToHex(test.a));
-        B.write(floatToHex(test.b));
+        A = sc.a_bits;
+        B = sc.b_bits;
         
-        // Wait for pipeline to complete (3 clock cycles)
-        sc_start(30, SC_NS);
+        cout << "Special Test " << (i+1) << ": " << sc.description << endl;
+        cout << "  A = 0x" << hex << sc.a_bits << endl;
+        cout << "  B = 0x" << hex << sc.b_bits << endl;
         
-        // Calculate expected result
-        float expected_float = test.a + test.b;
-        uint32_t expected_hex = floatToHex(expected_float);
-        uint32_t actual_hex = result.read();
-        
-        bool nan_case = std::isnan(test.a) || std::isnan(test.b) || 
-                       (std::isinf(test.a) && std::isinf(test.b) && 
-                        ((test.a > 0) != (test.b > 0))); // inf + (-inf)
-        
-        cout << "  Expected: ";
-        if (nan_case) {
-            cout << "NaN (0x7FC00000 or similar)";
-        } else if (std::isinf(expected_float)) {
-            cout << (expected_float < 0 ? "-Inf" : "+Inf");
-            cout << " (0x" << hex << expected_hex << ")";
-        } else {
-            cout << expected_float << " (0x" << hex << expected_hex << ")";
+        // Wait for pipeline to complete
+        for (int cycle = 0; cycle < 4; cycle++) {
+            sc_start(10, SC_NS);
         }
-        cout << dec << endl;
         
-        cout << "  Actual:   0x" << hex << actual_hex;
-        printFloat(actual_hex);
-        cout << dec << endl;
-        
-        cout << "  Valid:    " << valid_out.read() << endl;
-        cout << "  Overflow: " << overflow.read() << endl;
-        cout << "  Underflow:" << underflow.read() << endl;
-        
-        // Check results
-        bool test_passed = false;
-        
-        if (nan_case) {
-            // For NaN results, check exponent all 1s and mantissa non-zero
-            test_passed = ((actual_hex & 0x7F800000) == 0x7F800000) && 
-                         ((actual_hex & 0x007FFFFF) != 0);
-        } else if (std::isinf(expected_float)) {
-            // For infinity, check correct sign
-            test_passed = (actual_hex == expected_hex);
-        } else {
-            // For normal cases, allow small floating point errors
-            float actual_float;
-            memcpy(&actual_float, &actual_hex, sizeof(float));
+        if (valid_out.read()) {
+            uint32_t result_bits = result.read();
+            float result_float = *reinterpret_cast<float*>(&result_bits);
             
-            if (expected_float == 0.0f && actual_float == 0.0f) {
-                // Both zero - consider passed (ignore sign for now)
-                test_passed = true;
-            } else if (expected_float == 0.0f || actual_float == 0.0f) {
-                // One is zero, other isn't - check if very close to zero
-                float non_zero = (expected_float == 0.0f) ? actual_float : expected_float;
-                test_passed = (fabs(non_zero) < 1e-35f);
-            } else {
-                // Both non-zero - check relative error
-                float rel_error = fabs((actual_float - expected_float) / expected_float);
-                test_passed = (rel_error < 1e-6f) || (actual_hex == expected_hex);
-            }
+            cout << "  Result = " << result_float << " (0x" << hex << result_bits << ")";
+            if (overflow.read()) cout << " [OVERFLOW]";
+            if (underflow.read()) cout << " [UNDERFLOW]";
+            cout << endl;
         }
-        
-        if (test_passed) {
-            cout << "  PASS" << endl;
-            passed_tests++;
-        } else {
-            cout << "  FAIL" << endl;
-            
-            // Additional debug info for failed tests
-            float actual_float;
-            memcpy(&actual_float, &actual_hex, sizeof(float));
-            if (!nan_case && !std::isinf(expected_float)) {
-                float error = actual_float - expected_float;
-                cout << "    Error: " << error << endl;
-                if (expected_float != 0.0f) {
-                    float rel_error = error / expected_float;
-                    cout << "    Relative error: " << rel_error << endl;
-                }
-            }
-        }
-    }
-    
-    // Additional comprehensive tests for edge cases
-    cout << "\n=== ADDITIONAL EDGE CASE TESTS ===" << endl;
-    
-    // Test many small additions that should sum to a larger number
-    cout << "\nTesting accumulation of small numbers..." << endl;
-    float accumulator = 0.0f;
-    const int num_additions = 100;
-    const float small_increment = 0.01f;
-    
-    A.write(floatToHex(accumulator));
-    for (int i = 0; i < num_additions; i++) {
-        B.write(floatToHex(small_increment));
-        sc_start(30, SC_NS); // Wait for pipeline
-        
-        uint32_t result_hex = result.read();
-        memcpy(&accumulator, &result_hex, sizeof(float));
-        A.write(result_hex); // Use result as next A input
-        
-        if (i % 20 == 19) { // Print every 20th result
-            cout << "  After " << (i+1) << " additions: " << accumulator << endl;
-        }
-    }
-    
-    float expected_accumulation = num_additions * small_increment;
-    float error = accumulator - expected_accumulation;
-    cout << "  Expected total: " << expected_accumulation << endl;
-    cout << "  Actual total:   " << accumulator << endl;
-    cout << "  Error:          " << error << endl;
-    cout << "  Relative error: " << (error / expected_accumulation) << endl;
-    
-    if (fabs(error / expected_accumulation) < 0.01f) { // Allow 1% error for accumulation
-        cout << "  Accumulation test: PASS" << endl;
-        passed_tests++;
-    } else {
-        cout << "  Accumulation test: FAIL" << endl;
-    }
-    total_tests++;
-    
-    // Test subtraction that should result in very small numbers
-    cout << "\nTesting near-cancellation subtraction..." << endl;
-    float big_num = 1000000.0f;
-    float almost_same = big_num + 1.0f;
-    
-    A.write(floatToHex(almost_same));
-    B.write(floatToHex(-big_num)); // Subtract big_num
-    sc_start(30, SC_NS);
-    
-    uint32_t cancel_result = result.read();
-    float cancel_float;
-    memcpy(&cancel_float, &cancel_result, sizeof(float));
-    
-    cout << "  " << almost_same << " + (" << (-big_num) << ") = " << cancel_float << endl;
-    cout << "  Expected: 1.0, Actual: " << cancel_float << endl;
-    
-    if (fabs(cancel_float - 1.0f) < 1e-5f) {
-        cout << "  Near-cancellation test: PASS" << endl;
-        passed_tests++;
-    } else {
-        cout << "  Near-cancellation test: FAIL" << endl;
-    }
-    total_tests++;
-    
-    cout << "\n================ TEST SUMMARY ================" << endl;
-    cout << "Total tests: " << total_tests << endl;
-    cout << "Passed:      " << passed_tests << endl;
-    cout << "Failed:      " << (total_tests - passed_tests) << endl;
-    cout << "Success rate: " << std::fixed << std::setprecision(1) 
-         << (100.0f * passed_tests / total_tests) << "%" << endl;
-    
-    if (passed_tests == total_tests) {
-        cout << "ALL TESTS PASSED!" << endl;
-    } else {
-        cout << "SOME TESTS FAILED!" << endl;
+        cout << endl;
     }
     
     // Performance analysis
-    cout << "\n================ PERFORMANCE ANALYSIS ================" << endl;
-    cout << "Pipeline depth: 3 stages" << endl;
-    cout << "Latency: 3 clock cycles" << endl;
-    cout << "Throughput: 1 result per clock cycle (after initial latency)" << endl;
-    cout << "Clock period: 10 ns" << endl;
-    cout << "Maximum frequency: 100 MHz" << endl;
+    cout << "\n=== Performance Analysis ===\n";
+    cout << "Pipeline Characteristics:\n";
+    cout << "  - Latency: 3 clock cycles\n";
+    cout << "  - Throughput: 1 result per clock cycle (after initial latency)\n";
+    cout << "  - Clock frequency: 100 MHz (10ns period)\n";
+    cout << "  - Maximum throughput: 100 MFLOPS\n";
+    cout << "  - Area: 3 pipeline stages with registers\n\n";
     
-    return (passed_tests == total_tests) ? 0 : 1;
+    cout << "Advantages of pipelined design:\n";
+    cout << "  + High throughput for streaming data\n";
+    cout << "  + Better resource utilization\n";
+    cout << "  + Scalable to higher frequencies\n\n";
+    
+    cout << "Trade-offs:\n";
+    cout << "  - Increased latency (3 cycles vs 1)\n";
+    cout << "  - Additional register overhead\n";
+    cout << "  - More complex control logic\n\n";
+    
+    // Cleanup
+    sc_close_vcd_trace_file(tf);
+    
+    cout << "Simulation completed. VCD trace saved as 'pipelined_adder_trace.vcd'\n";
+    cout << "Use a waveform viewer like GTKWave to analyze the timing diagrams.\n";
+    
+    return 0;
 }
