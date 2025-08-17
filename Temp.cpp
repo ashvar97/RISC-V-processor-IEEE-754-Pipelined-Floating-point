@@ -1,5 +1,4 @@
-// Code your testbench here
-// or browse Examples
+// Simple 4-Stage FPU Pipeline: Fetch -> Decode -> Execute -> Writeback
 #include <systemc.h>
 #include <cmath>
 #include <vector>
@@ -10,109 +9,215 @@
 #include <iostream>
 using namespace std;
 
-
-// Helper function to convert float to IEEE 754 format
+// Helper functions
 sc_uint<32> float_to_ieee754(float f) {
     union { float f; uint32_t i; } u;
     u.f = f;
     return sc_uint<32>(u.i);
 }
 
-// Helper function to convert IEEE 754 to float
 float ieee754_to_float(sc_uint<32> ieee) {
     union { float f; uint32_t i; } u;
     u.i = ieee.to_uint();
     return u.f;
 }
 
-// Instruction formats and opcodes
-enum fp_opcode_t {
-    FP_ADD    = 0x0,
-    FP_SUB    = 0x1, 
-    FP_MUL    = 0x2,
-    FP_DIV    = 0x3,
-    FP_LOAD   = 0x4,
-    FP_STORE  = 0x5,
-    FP_MOVE   = 0x6,
-    FP_NOP    = 0x7
-};
-
-// Instruction format: [31:28] opcode, [27:23] rd, [22:18] rs1, [17:13] rs2, [12:0] immediate
+// Instruction format: [31:28] opcode, [27:23] rd, [22:18] rs1, [17:13] rs2, [12:0] unused
 struct fp_instruction_t {
     sc_uint<4>  opcode;
-    sc_uint<5>  rd;     // destination register
-    sc_uint<5>  rs1;    // source register 1
-    sc_uint<5>  rs2;    // source register 2  
-    sc_uint<13> imm;    // immediate value
+    sc_uint<5>  rd;     
+    sc_uint<5>  rs1;    
+    sc_uint<5>  rs2;    
+    sc_uint<13> unused;
     
-    fp_instruction_t() : opcode(0), rd(0), rs1(0), rs2(0), imm(0) {}
-    
-    fp_instruction_t(sc_uint<32> inst) {
-        opcode = (inst >> 28) & 0xF;
-        rd = (inst >> 23) & 0x1F;
-        rs1 = (inst >> 18) & 0x1F;
-        rs2 = (inst >> 13) & 0x1F;
-        imm = inst & 0x1FFF;
-    }
+    fp_instruction_t(sc_uint<4> op, sc_uint<5> dst, sc_uint<5> src1, sc_uint<5> src2) 
+        : opcode(op), rd(dst), rs1(src1), rs2(src2), unused(0) {}
     
     sc_uint<32> to_word() const {
         return (sc_uint<32>(opcode) << 28) | (sc_uint<32>(rd) << 23) | 
-               (sc_uint<32>(rs1) << 18) | (sc_uint<32>(rs2) << 13) | sc_uint<32>(imm);
+               (sc_uint<32>(rs1) << 18) | (sc_uint<32>(rs2) << 13);
     }
 };
 
-
-// ========== STAGE 3: EXECUTE (RV32F focused) ==========
-SC_MODULE(Execute) {
-    // Clock and control
+// ========== FETCH STAGE ==========
+SC_MODULE(Fetch) {
     sc_in<bool> clk;
     sc_in<bool> reset;
     sc_in<bool> stall;
     
-    // Input from ID stage
+    sc_out<sc_uint<32>> pc_out;
+    sc_out<sc_uint<32>> instruction_out;
+    sc_out<bool> valid_out;
+    
+    // Simple instruction memory
+    vector<sc_uint<32>> imem;
+    sc_uint<32> pc;
+    
+    void fetch_process() {
+        if (reset.read()) {
+            pc = 0;
+            pc_out.write(0);
+            instruction_out.write(0);
+            valid_out.write(false);
+        } else if (!stall.read()) {
+            if (pc < imem.size()) {
+                pc_out.write(pc * 4); // PC in bytes
+                instruction_out.write(imem[pc]);
+                valid_out.write(true);
+                pc++;
+            } else {
+                valid_out.write(false);
+            }
+        }
+    }
+    
+    void load_program(const vector<sc_uint<32>>& program) {
+        imem = program;
+    }
+    
+    SC_CTOR(Fetch) {
+        SC_METHOD(fetch_process);
+        sensitive << clk.pos() << reset << stall;
+    }
+};
+
+// ========== DECODE STAGE ==========
+SC_MODULE(Decode) {
+    sc_in<bool> clk;
+    sc_in<bool> reset;
+    sc_in<bool> stall;
+    
+    // From Fetch
+    sc_in<sc_uint<32>> pc_in;
+    sc_in<sc_uint<32>> instruction_in;
+    sc_in<bool> valid_in;
+    
+    // To Execute
+    sc_out<sc_uint<32>> pc_out;
+    sc_out<sc_uint<4>> opcode_out;
+    sc_out<sc_uint<5>> rd_out;
+    sc_out<sc_uint<32>> operand1_out;
+    sc_out<sc_uint<32>> operand2_out;
+    sc_out<bool> valid_out;
+    
+    // Register file (32 FP registers)
+    sc_uint<32> fp_registers[32];
+    
+    void decode_process() {
+        if (reset.read()) {
+            pc_out.write(0);
+            opcode_out.write(0);
+            rd_out.write(0);
+            operand1_out.write(0);
+            operand2_out.write(0);
+            valid_out.write(false);
+            
+            // Initialize registers to zero
+            for (int i = 0; i < 32; i++) {
+                fp_registers[i] = 0;
+            }
+        } else if (!stall.read() && valid_in.read()) {
+            sc_uint<32> inst = instruction_in.read();
+            
+            // Decode instruction fields
+            sc_uint<4> opcode = (inst >> 28) & 0xF;
+            sc_uint<5> rd = (inst >> 23) & 0x1F;
+            sc_uint<5> rs1 = (inst >> 18) & 0x1F;
+            sc_uint<5> rs2 = (inst >> 13) & 0x1F;
+            
+            // Read operands from register file
+            sc_uint<32> op1 = fp_registers[rs1.to_uint()];
+            sc_uint<32> op2 = fp_registers[rs2.to_uint()];
+            
+            // Forward to Execute stage
+            pc_out.write(pc_in.read());
+            opcode_out.write(opcode);
+            rd_out.write(rd);
+            operand1_out.write(op1);
+            operand2_out.write(op2);
+            valid_out.write(true);
+        } else {
+            valid_out.write(false);
+        }
+    }
+    
+    // Method to write to register file (called by writeback)
+    void write_register(sc_uint<5> reg, sc_uint<32> value) {
+        if (reg.to_uint() != 0) { // Don't write to register 0
+            fp_registers[reg.to_uint()] = value;
+        }
+    }
+    
+    // Method to set initial register values for testing
+    void set_register(int reg, float value) {
+        if (reg > 0 && reg < 32) {
+            fp_registers[reg] = float_to_ieee754(value);
+        }
+    }
+    
+    SC_CTOR(Decode) {
+        SC_METHOD(decode_process);
+        sensitive << clk.pos() << reset << stall << valid_in << instruction_in << pc_in;
+    }
+};
+
+// ========== EXECUTE STAGE (Reusing your working Execute stage) 
+
+SC_MODULE(Execute) {
+    sc_in<bool> clk;
+    sc_in<bool> reset;
+    sc_in<bool> stall;
+    
+    // Input from Decode stage
     sc_in<sc_uint<32>> pc_in;
     sc_in<sc_uint<4>> opcode_in;
     sc_in<sc_uint<5>> rd_in;
     sc_in<sc_uint<32>> operand1_in;
     sc_in<sc_uint<32>> operand2_in;
-    sc_in<sc_uint<13>> immediate_in;
     sc_in<bool> valid_in;
     
-    // Output to MEM stage
+    // Output to Writeback stage
     sc_out<sc_uint<32>> pc_out;
     sc_out<sc_uint<4>> opcode_out;
     sc_out<sc_uint<5>> rd_out;
     sc_out<sc_uint<32>> result_out;
     sc_out<bool> valid_out;
-    
-    // FPU status outputs
-    sc_out<bool> fpu_overflow;
-    sc_out<bool> fpu_underflow;
-    sc_out<bool> fpu_divide_by_zero;
 
 private:
-    // FPU instances - Using pipelined units
+    // FPU instances
     ieee754mult *fpu_mult;
     ieee754add *fpu_add;
     ieee754_subtractor *fpu_sub;
-    ieee754div *fpu_div;
     
-    // Internal signals for FPU operations
+    // Shared FPU input signals (back to original approach)
     sc_signal<sc_uint<32>> fpu_a, fpu_b;
     sc_signal<bool> fpu_valid_in;
-    sc_signal<sc_uint<32>> mult_result, add_result, sub_result, div_result;
-    sc_signal<bool> mult_valid, add_valid, sub_valid, div_valid;
+    sc_signal<sc_uint<32>> mult_result, add_result, sub_result;
+    sc_signal<bool> mult_valid, add_valid, sub_valid;
     sc_signal<bool> mult_overflow, mult_underflow;
     sc_signal<bool> add_overflow, add_underflow;
     sc_signal<bool> sub_overflow, sub_underflow;
-    sc_signal<bool> div_overflow, div_underflow, div_by_zero;
     
-    // RV32F opcodes
+    // NEW: Pipeline registers to track FPU operations through their 3-cycle latency
+    struct fpu_pipeline_entry {
+        sc_uint<32> pc;
+        sc_uint<4> opcode;
+        sc_uint<5> rd;
+        bool valid;
+    };
+    
+    // 3-stage pipeline for each FPU result
+    fpu_pipeline_entry mult_pipe[3];
+    fpu_pipeline_entry add_pipe[3];  
+    fpu_pipeline_entry sub_pipe[3];
+    
+    // Track if adder needs continuous valid signal
+    int add_cycles_remaining;
+    
     enum opcodes {
         OP_FADD = 0x0,
         OP_FSUB = 0x1,
-        OP_FMUL = 0x2,
-        OP_FDIV = 0x3
+        OP_FMUL = 0x2
     };
 
 public:
@@ -123,94 +228,149 @@ public:
             rd_out.write(0);
             result_out.write(0);
             valid_out.write(false);
-            fpu_overflow.write(false);
-            fpu_underflow.write(false);
-            fpu_divide_by_zero.write(false);
-            
-            // Reset FPU inputs
             fpu_a.write(0);
             fpu_b.write(0);
             fpu_valid_in.write(false);
+            add_cycles_remaining = 0;
             
-        } else if (!stall.read() && valid_in.read()) {
-            sc_uint<4> opcode = opcode_in.read();
-            sc_uint<32> op1 = operand1_in.read();
-            sc_uint<32> op2 = operand2_in.read();
-            sc_uint<32> result = 0;
+            // Clear pipeline registers
+            for (int i = 0; i < 3; i++) {
+                mult_pipe[i].valid = false;
+                add_pipe[i].valid = false;
+                sub_pipe[i].valid = false;
+            }
             
-            // Set FPU inputs
-            fpu_a.write(op1);
-            fpu_b.write(op2);
-            fpu_valid_in.write(true); // Always valid for RV32F operations
+        } else if (!stall.read()) {
             
-            switch (opcode.to_uint()) {                    
-                case OP_FADD:
-                    result = add_result.read();
-                    fpu_overflow.write(add_overflow.read());
-                    fpu_underflow.write(add_underflow.read());
-                    break;
-                    
-                case OP_FSUB:
-                    result = sub_result.read();
-                    fpu_overflow.write(sub_overflow.read());
-                    fpu_underflow.write(sub_underflow.read());
-                    break;
-                    
-                case OP_FMUL:
-                    result = mult_result.read();
-                    fpu_overflow.write(mult_overflow.read());
-                    fpu_underflow.write(mult_underflow.read());
-                    break;
-                    
-                case OP_FDIV:
-                    result = div_result.read();
-                    fpu_overflow.write(div_overflow.read());
-                    fpu_underflow.write(div_underflow.read());
-                    fpu_divide_by_zero.write(div_by_zero.read());
-                    break;
-                    
-                default: // Invalid opcode
-                    result = 0;
+            // NEW: Handle incoming instruction
+            if (valid_in.read()) {
+                sc_uint<4> opcode = opcode_in.read();
+                sc_uint<32> op1 = operand1_in.read();
+                sc_uint<32> op2 = operand2_in.read();
+                
+                // Set FPU inputs
+                fpu_a.write(op1);
+                fpu_b.write(op2);
+                
+                // Insert instruction into appropriate pipeline tracker
+                switch (opcode.to_uint()) {
+                    case OP_FADD:
+                        fpu_valid_in.write(true);  // Adder needs this
+                        add_cycles_remaining = 3;  // Track adder's need for valid signal
+                        add_pipe[0] = {pc_in.read(), opcode, rd_in.read(), true};
+                        break;
+                        
+                    case OP_FSUB:
+                        fpu_valid_in.write(false); // Subtractor ignores valid_in
+                        sub_pipe[0] = {pc_in.read(), opcode, rd_in.read(), true};
+                        break;
+                        
+                    case OP_FMUL:
+                        fpu_valid_in.write(false); // Multiplier ignores valid_in
+                        mult_pipe[0] = {pc_in.read(), opcode, rd_in.read(), true};
+                        break;
+                        
+                    default:
+                        fpu_valid_in.write(false);
+                        break;
+                }
+            } else {
+                // NEW: Maintain adder's valid signal if it's still processing
+                if (add_cycles_remaining > 0) {
+                    fpu_valid_in.write(true);
+                } else {
                     fpu_valid_in.write(false);
-                    break;
+                }
             }
             
-            // Output results
-            pc_out.write(pc_in.read());
-            opcode_out.write(opcode);
-            rd_out.write(rd_in.read());
-            result_out.write(result);
+            // NEW: Check for completed FPU operations (stage 2 of each pipeline)
+            sc_uint<32> result = 0;
+            bool result_ready = false;
+            sc_uint<32> output_pc = 0;
+            sc_uint<4> output_opcode = 0;
+            sc_uint<5> output_rd = 0;
             
-            // For pipelined FP operations, output is valid when FPU says it's valid
-            bool fp_result_valid = false;
-            switch (opcode.to_uint()) {
-                case OP_FADD:
-                    fp_result_valid = add_valid.read();
-                    break;
-                case OP_FSUB:
-                    fp_result_valid = sub_valid.read();
-                    break;
-                case OP_FMUL:
-                    fp_result_valid = mult_valid.read();
-                    break;
-                case OP_FDIV:
-                    fp_result_valid = div_valid.read();
-                    break;
-                default:
-                    fp_result_valid = false;
-                    break;
+            // Check multiplier completion
+            if (mult_pipe[2].valid && mult_valid.read()) {
+                result = mult_result.read();
+                result_ready = true;
+                output_pc = mult_pipe[2].pc;
+                output_opcode = mult_pipe[2].opcode;
+                output_rd = mult_pipe[2].rd;
             }
-            valid_out.write(fp_result_valid);
+            // Check adder completion  
+            else if (add_pipe[2].valid && add_valid.read()) {
+                result = add_result.read();
+                result_ready = true;
+                output_pc = add_pipe[2].pc;
+                output_opcode = add_pipe[2].opcode;
+                output_rd = add_pipe[2].rd;
+            }
+            // Check subtractor completion
+            else if (sub_pipe[2].valid && sub_valid.read()) {
+                result = sub_result.read();
+                result_ready = true;
+                output_pc = sub_pipe[2].pc;
+                output_opcode = sub_pipe[2].opcode;
+                output_rd = sub_pipe[2].rd;
+            }
+            
+            // Output completed result
+            if (result_ready) {
+                pc_out.write(output_pc);
+                opcode_out.write(output_opcode);
+                rd_out.write(output_rd);
+                result_out.write(result);
+                valid_out.write(true);
+            } else {
+                valid_out.write(false);
+            }
         } else {
             valid_out.write(false);
-            fpu_valid_in.write(false);
+            if (add_cycles_remaining > 0) {
+                fpu_valid_in.write(true);
+            } else {
+                fpu_valid_in.write(false);
+            }
+        }
+    }
+
+    void pipeline_advance() {
+        if (reset.read()) {
+            add_cycles_remaining = 0;
+            for (int i = 0; i < 3; i++) {
+                mult_pipe[i].valid = false;
+                add_pipe[i].valid = false;
+                sub_pipe[i].valid = false;
+            }
+        } else if (!stall.read()) {
+            // NEW: Advance all pipeline stages
+            for (int i = 2; i > 0; i--) {
+                mult_pipe[i] = mult_pipe[i-1];
+                add_pipe[i] = add_pipe[i-1];
+                sub_pipe[i] = sub_pipe[i-1];
+            }
+            mult_pipe[0].valid = false;
+            add_pipe[0].valid = false;
+            sub_pipe[0].valid = false;
+            
+            // Decrement adder valid signal counter
+            if (add_cycles_remaining > 0) {
+                add_cycles_remaining--;
+            }
         }
     }
 
     SC_CTOR(Execute) {
-        // Instantiate FPU units
+        // Initialize pipeline registers
+        add_cycles_remaining = 0;
+        for (int i = 0; i < 3; i++) {
+            mult_pipe[i].valid = false;
+            add_pipe[i].valid = false;
+            sub_pipe[i].valid = false;
+        }
         
-        // Multiplier
+        // Instantiate FPU units (same as original)
         fpu_mult = new ieee754mult("fpu_mult");
         fpu_mult->A(fpu_a);
         fpu_mult->B(fpu_b);
@@ -221,19 +381,17 @@ public:
         fpu_mult->overflow(mult_overflow);
         fpu_mult->underflow(mult_underflow);
         
-        // Pipelined Adder
         fpu_add = new ieee754add("fpu_add");
         fpu_add->clk(clk);
         fpu_add->reset(reset);
         fpu_add->A(fpu_a);
         fpu_add->B(fpu_b);
-        fpu_add->valid_in(fpu_valid_in);
+        fpu_add->valid_in(fpu_valid_in);  // KEY: This needs to stay true for 3 cycles
         fpu_add->result(add_result);
         fpu_add->valid_out(add_valid);
         fpu_add->overflow(add_overflow);
         fpu_add->underflow(add_underflow);
         
-        // Subtractor
         fpu_sub = new ieee754_subtractor("fpu_sub");
         fpu_sub->A(fpu_a);
         fpu_sub->B(fpu_b);
@@ -244,279 +402,258 @@ public:
         fpu_sub->overflow(sub_overflow);
         fpu_sub->underflow(sub_underflow);
         
-        // Divider
-        fpu_div = new ieee754div("fpu_div");
-        fpu_div->a(fpu_a);
-        fpu_div->b(fpu_b);
-        fpu_div->reset(reset);
-        fpu_div->clk(clk);
-        fpu_div->result(div_result);
-        fpu_div->valid_out(div_valid);
-        fpu_div->overflow(div_overflow);
-        fpu_div->underflow(div_underflow);
-        fpu_div->divide_by_zero(div_by_zero);
-        
         SC_METHOD(execute_process);
         sensitive << clk.pos() << reset << stall << valid_in << opcode_in 
                  << operand1_in << operand2_in << rd_in << pc_in
-                 << mult_result << add_result << sub_result << div_result
-                 << mult_valid << add_valid << sub_valid << div_valid
-                 << mult_overflow << mult_underflow << add_overflow << add_underflow
-                 << sub_overflow << sub_underflow << div_overflow << div_underflow << div_by_zero;
+                 << mult_result << add_result << sub_result
+                 << mult_valid << add_valid << sub_valid;
+                 
+        SC_METHOD(pipeline_advance);
+        sensitive << clk.pos();
     }
     
     ~Execute() {
         delete fpu_mult;
         delete fpu_add;
         delete fpu_sub;
-        delete fpu_div;
+    }
+};
+// ========== WRITEBACK STAGE ==========
+SC_MODULE(Writeback) {
+    sc_in<bool> clk;
+    sc_in<bool> reset;
+    sc_in<bool> stall;
+    
+    // From Execute
+    sc_in<sc_uint<32>> pc_in;
+    sc_in<sc_uint<4>> opcode_in;
+    sc_in<sc_uint<5>> rd_in;
+    sc_in<sc_uint<32>> result_in;
+    sc_in<bool> valid_in;
+    
+    // Pointer to Decode stage for register file access
+    Decode *decode_stage;
+    
+    void writeback_process() {
+        if (reset.read()) {
+            // Nothing to do on reset
+        } else if (!stall.read() && valid_in.read()) {
+            sc_uint<5> rd = rd_in.read();
+            sc_uint<32> result = result_in.read();
+            
+            // Write result back to register file
+            if (decode_stage) {
+                decode_stage->write_register(rd, result);
+            }
+        }
+    }
+    
+    void set_decode_stage(Decode *decode_ptr) {
+        decode_stage = decode_ptr;
+    }
+    
+    SC_CTOR(Writeback) : decode_stage(nullptr) {
+        SC_METHOD(writeback_process);
+        sensitive << clk.pos() << reset << stall << valid_in << rd_in << result_in;
     }
 };
 
-
-
-// ========== DIRECT EXECUTE STAGE FPU TESTBENCH ==========
-// ========== DIRECT EXECUTE STAGE FPU TESTBENCH ==========
-SC_MODULE(ExecuteFPUTestbench) {
+// ========== SIMPLE PIPELINE TESTBENCH ==========
+SC_MODULE(SimplePipelineTestbench) {
     sc_clock clk;
     sc_signal<bool> reset, stall;
     
-    // Execute stage interface signals
-    sc_signal<sc_uint<32>> pc_in, operand1_in, operand2_in;
-    sc_signal<sc_uint<4>> opcode_in;
-    sc_signal<sc_uint<5>> rd_in;
-    sc_signal<sc_uint<13>> immediate_in;
-    sc_signal<bool> valid_in;
-    
-    // Execute stage outputs
-    sc_signal<sc_uint<32>> pc_out, result_out;
-    sc_signal<sc_uint<4>> opcode_out;
-    sc_signal<sc_uint<5>> rd_out;
-    sc_signal<bool> valid_out;
-    sc_signal<bool> fpu_overflow, fpu_underflow, fpu_divide_by_zero;
-    
-    // Execute stage instance - this contains the FPU units!
+    // Pipeline stage instances
+    Fetch *fetch_stage;
+    Decode *decode_stage;
     Execute *execute_stage;
+    Writeback *writeback_stage;
     
-    // Test results tracking
+    // Inter-stage signals
+    sc_signal<sc_uint<32>> fetch_pc, fetch_inst;
+    sc_signal<bool> fetch_valid;
+    
+    sc_signal<sc_uint<32>> decode_pc;
+    sc_signal<sc_uint<4>> decode_opcode;
+    sc_signal<sc_uint<5>> decode_rd;
+    sc_signal<sc_uint<32>> decode_op1, decode_op2;
+    sc_signal<bool> decode_valid;
+    
+    sc_signal<sc_uint<32>> execute_pc, execute_result;
+    sc_signal<sc_uint<4>> execute_opcode;
+    sc_signal<sc_uint<5>> execute_rd;
+    sc_signal<bool> execute_valid;
+    
     int tests_passed = 0;
     int tests_failed = 0;
-    int total_tests = 0;
     
-    // Test vectors for FPU operations
-    struct FPUTest {
-        float a, b;
-        float expected_add, expected_sub, expected_mult;
-        string description;
-    };
-    
-    vector<FPUTest> fpu_tests;
-    
-    void init_fpu_tests() {
-        fpu_tests = {
-            {1.0f, 2.0f, 3.0f, -1.0f, 2.0f, "Simple positive numbers"},
-            {-1.5f, 3.2f, 1.7f, -4.7f, -4.8f, "Mixed signs"},
-            {3.14159f, 2.71828f, 5.85987f, 0.42331f, 8.53973f, "Pi and e"},
-            {0.0f, 5.0f, 5.0f, -5.0f, 0.0f, "Zero operand"},
-            {100.0f, 25.0f, 125.0f, 75.0f, 2500.0f, "Large numbers"},
-            {1.0f, 0.0f, 1.0f, 1.0f, 0.0f, "Multiplication by zero"}
-        };
+    void create_test_program() {
+        vector<sc_uint<32>> program;
+        
+        // Test 1: FADD f3, f1, f2  (3.0 + 2.0 = 5.0)
+        fp_instruction_t inst1(0x0, 3, 1, 2);  // FADD
+        program.push_back(inst1.to_word());
+        
+        // Test 2: FSUB f4, f1, f2  (3.0 - 2.0 = 1.0)
+        fp_instruction_t inst2(0x1, 4, 1, 2);  // FSUB
+        program.push_back(inst2.to_word());
+        
+        // Test 3: FMUL f5, f1, f2  (3.0 * 2.0 = 6.0)
+        fp_instruction_t inst3(0x2, 5, 1, 2);  // FMUL
+        program.push_back(inst3.to_word());
+        
+        fetch_stage->load_program(program);
     }
     
-    // Check if result matches expected value
-    bool check_result(float actual, float expected, const string& operation) {
-        bool passed = false;
+    void setup_initial_registers() {
+        // Set up test values in registers
+        decode_stage->set_register(1, 3.0f);  // f1 = 3.0
+        decode_stage->set_register(2, 2.0f);  // f2 = 2.0
+    }
+    
+    bool check_result(int reg, float expected, const string& test_name) {
+        float actual = ieee754_to_float(decode_stage->fp_registers[reg]);
+        bool passed = abs(actual - expected) < 1e-6f;
         
-        if (std::isnan(expected) && std::isnan(actual)) {
-            passed = true;
-        } else if (std::isinf(expected) && std::isinf(actual) && 
-                  std::signbit(expected) == std::signbit(actual)) {
-            passed = true;
-        } else if (std::isfinite(expected) && std::isfinite(actual)) {
-            float tolerance = std::max(1e-5f * std::abs(expected), 1e-6f);
-            passed = std::abs(actual - expected) < tolerance;
-        }
-        
-        cout << "    " << operation << ": " << actual << " (expected: " << expected << ") - " 
+        cout << test_name << ": f" << reg << " = " << actual 
+             << " (expected: " << expected << ") - " 
              << (passed ? "PASS" : "FAIL") << endl;
-        
+             
         if (passed) tests_passed++;
         else tests_failed++;
-        total_tests++;
         
         return passed;
     }
     
-    // Execute FPU operation directly through Execute stage
-    void test_fpu_operation(int opcode, float a, float b, float expected, const string& op_name) {
-        cout << "\n  Testing " << op_name << ": " << a << " " << op_name << " " << b << endl;
-        
-        // Setup inputs to Execute stage
-        pc_in.write(0x1000);
-        opcode_in.write(opcode);
-        rd_in.write(1);  // Destination register
-        operand1_in.write(float_to_ieee754(a));
-        operand2_in.write(float_to_ieee754(b));
-        immediate_in.write(0);
-        valid_in.write(true);
-        stall.write(false);
-        
-        // Wait one clock cycle to start operation
-        wait(10, SC_NS);
-        
-        // Determine cycles needed based on operation
-        int max_cycles = 5;   // Default for add/sub/mult
-        
-        // Wait for result to be valid
-        bool found_result = false;
-        for (int cycle = 0; cycle < max_cycles; cycle++) {
-            wait(10, SC_NS);
-            
-            if (valid_out.read()) {
-                // Get the result from Execute stage
-                sc_uint<32> result_bits = result_out.read();
-                float actual = ieee754_to_float(result_bits);
-                
-                // Check the result
-                check_result(actual, expected, op_name);
-                
-                // Check FPU flags
-                if (fpu_overflow.read()) {
-                    cout << "      [OVERFLOW flag detected]" << endl;
-                }
-                if (fpu_underflow.read()) {
-                    cout << "      [UNDERFLOW flag detected]" << endl;
-                }
-                if (fpu_divide_by_zero.read()) {
-                    cout << "      [DIVIDE_BY_ZERO flag detected]" << endl;
-                }
-                
-                found_result = true;
-                break;
-            }
-        }
-        
-        if (!found_result) {
-            cout << "    ERROR: No valid result after " << max_cycles << " cycles!" << endl;
-            tests_failed++;
-            total_tests++;
-        }
-        
-        // Clear inputs
-        valid_in.write(false);
-        wait(10, SC_NS);
-    }
-    
-    void execute_fpu_test_case(const FPUTest& test) {
-        cout << "\n--- Testing: " << test.description << " ---" << endl;
-        cout << "Operands: A=" << test.a << " (0x" << hex << float_to_ieee754(test.a).to_uint() << dec << "), "
-             << "B=" << test.b << " (0x" << hex << float_to_ieee754(test.b).to_uint() << dec << ")" << endl;
-        
-        // Test the three FPU operations
-        test_fpu_operation(0x0, test.a, test.b, test.expected_add, "FADD");
-        test_fpu_operation(0x1, test.a, test.b, test.expected_sub, "FSUB");
-        test_fpu_operation(0x2, test.a, test.b, test.expected_mult, "FMUL");
-    }
-    
-    void run_comprehensive_fpu_tests() {
-        cout << "\n=== TESTING FPU OPERATIONS DIRECTLY THROUGH EXECUTE STAGE ===" << endl;
-        
-        for (size_t i = 0; i < fpu_tests.size(); i++) {
-            execute_fpu_test_case(fpu_tests[i]);
-            wait(20, SC_NS); // Brief pause between test cases
-        }
-    }
-    
-    void print_test_summary() {
-        cout << "\n" << string(70, '=') << endl;
-        cout << "=== EXECUTE STAGE FPU TEST RESULTS SUMMARY ===" << endl;
-        cout << string(70, '=') << endl;
-        cout << "Total Tests Run:    " << total_tests << endl;
-        cout << "Tests Passed:       " << tests_passed << " (" 
-             << fixed << setprecision(1) << (100.0f * tests_passed / total_tests) << "%)" << endl;
-        cout << "Tests Failed:       " << tests_failed << " (" 
-             << fixed << setprecision(1) << (100.0f * tests_failed / total_tests) << "%)" << endl;
-        cout << string(70, '=') << endl;
-        
-        if (tests_failed == 0) {
-            cout << "🎉 ALL FPU TESTS PASSED! The FPU units in Execute stage are working perfectly!" << endl;
-        } else if (tests_passed > tests_failed) {
-            cout << "⚠️  MOST TESTS PASSED. Some issues detected in FPU implementation." << endl;
-        } else {
-            cout << "❌ MANY TESTS FAILED. Check FPU unit implementations in Execute stage." << endl;
-        }
-        cout << string(70, '=') << endl;
-    }
-    
     void test_process() {
-        cout << "\n=== DIRECT EXECUTE STAGE FPU VERIFICATION ===" << endl;
-        cout << "Testing FPU units directly through Execute stage (bypassing full processor)" << endl;
-        cout << "This tests the actual FPU hardware without pipeline complexities" << endl;
-        cout << "Testing operations: FADD, FSUB, FMUL" << endl;
+        cout << "\n=== SIMPLE 4-STAGE FPU PIPELINE TEST ===" << endl;
+        cout << "Testing: Fetch -> Decode -> Execute -> Writeback" << endl;
+        cout << "Operations: FADD, FSUB, FMUL" << endl;
         
-        // Initialize test data
-        init_fpu_tests();
-        
-        // Reset sequence
-        cout << "\nResetting Execute stage..." << endl;
+        // Reset pipeline
+        cout << "\nResetting pipeline..." << endl;
         reset.write(true);
+        stall.write(false);
         wait(50, SC_NS);
         reset.write(false);
         wait(20, SC_NS);
-        cout << "Reset complete." << endl;
         
-        // Run comprehensive FPU tests
-        run_comprehensive_fpu_tests();
+        // Setup test data
+        setup_initial_registers();
+        create_test_program();
         
-        // Print final results
-        print_test_summary();
+        cout << "\nInitial register values:" << endl;
+        cout << "f1 = 3.0, f2 = 2.0" << endl;
         
-        cout << "\n=== EXECUTE STAGE FPU TESTING COMPLETED ===" << endl;
+        cout << "\nRunning pipeline..." << endl;
+        
+        // Run pipeline for enough cycles to complete all instructions
+        // Need extra cycles for FPU latency
+        int max_cycles = 50;
+        for (int cycle = 0; cycle < max_cycles; cycle++) {
+            wait(10, SC_NS);
+            
+            // Check if we have results after sufficient cycles
+            if (cycle > 20 && cycle % 10 == 0) {
+                cout << "\n--- Checking results at cycle " << cycle << " ---" << endl;
+                check_result(3, 5.0f, "Test 1 (FADD 3+2)");
+                check_result(4, 1.0f, "Test 2 (FSUB 3-2)");
+                check_result(5, 6.0f, "Test 3 (FMUL 3*2)");
+            }
+        }
+        
+        cout << "\n=== FINAL RESULTS ===" << endl;
+        cout << "Tests Passed: " << tests_passed << endl;
+        cout << "Tests Failed: " << tests_failed << endl;
+        
+        if (tests_failed == 0) {
+            cout << "🎉 ALL PIPELINE TESTS PASSED!" << endl;
+        } else {
+            cout << "❌ Some pipeline tests failed." << endl;
+        }
+        
         sc_stop();
     }
     
-    SC_CTOR(ExecuteFPUTestbench) : clk("clk", 10, SC_NS) {
-        // Instantiate only the Execute stage (which contains FPU units)
-        execute_stage = new Execute("execute_stage_under_test");
+    SC_CTOR(SimplePipelineTestbench) : clk("clk", 10, SC_NS) {
+        // Instantiate pipeline stages
+        fetch_stage = new Fetch("fetch");
+        decode_stage = new Decode("decode");
+        execute_stage = new Execute("execute");
+        writeback_stage = new Writeback("writeback");
+        
+        // Connect Fetch stage
+        fetch_stage->clk(clk);
+        fetch_stage->reset(reset);
+        fetch_stage->stall(stall);
+        fetch_stage->pc_out(fetch_pc);
+        fetch_stage->instruction_out(fetch_inst);
+        fetch_stage->valid_out(fetch_valid);
+        
+        // Connect Decode stage
+        decode_stage->clk(clk);
+        decode_stage->reset(reset);
+        decode_stage->stall(stall);
+        decode_stage->pc_in(fetch_pc);
+        decode_stage->instruction_in(fetch_inst);
+        decode_stage->valid_in(fetch_valid);
+        decode_stage->pc_out(decode_pc);
+        decode_stage->opcode_out(decode_opcode);
+        decode_stage->rd_out(decode_rd);
+        decode_stage->operand1_out(decode_op1);
+        decode_stage->operand2_out(decode_op2);
+        decode_stage->valid_out(decode_valid);
+        
+        // Connect Execute stage
         execute_stage->clk(clk);
         execute_stage->reset(reset);
         execute_stage->stall(stall);
-        execute_stage->pc_in(pc_in);
-        execute_stage->opcode_in(opcode_in);
-        execute_stage->rd_in(rd_in);
-        execute_stage->operand1_in(operand1_in);
-        execute_stage->operand2_in(operand2_in);
-        execute_stage->immediate_in(immediate_in);
-        execute_stage->valid_in(valid_in);
-        execute_stage->pc_out(pc_out);
-        execute_stage->opcode_out(opcode_out);
-        execute_stage->rd_out(rd_out);
-        execute_stage->result_out(result_out);
-        execute_stage->valid_out(valid_out);
-        execute_stage->fpu_overflow(fpu_overflow);
-        execute_stage->fpu_underflow(fpu_underflow);
-        execute_stage->fpu_divide_by_zero(fpu_divide_by_zero);
+        execute_stage->pc_in(decode_pc);
+        execute_stage->opcode_in(decode_opcode);
+        execute_stage->rd_in(decode_rd);
+        execute_stage->operand1_in(decode_op1);
+        execute_stage->operand2_in(decode_op2);
+        execute_stage->valid_in(decode_valid);
+        execute_stage->pc_out(execute_pc);
+        execute_stage->opcode_out(execute_opcode);
+        execute_stage->rd_out(execute_rd);
+        execute_stage->result_out(execute_result);
+        execute_stage->valid_out(execute_valid);
+        
+        // Connect Writeback stage
+        writeback_stage->clk(clk);
+        writeback_stage->reset(reset);
+        writeback_stage->stall(stall);
+        writeback_stage->pc_in(execute_pc);
+        writeback_stage->opcode_in(execute_opcode);
+        writeback_stage->rd_in(execute_rd);
+        writeback_stage->result_in(execute_result);
+        writeback_stage->valid_in(execute_valid);
+        
+        // Set decode stage pointer for writeback
+        writeback_stage->set_decode_stage(decode_stage);
         
         SC_THREAD(test_process);
     }
     
-    ~ExecuteFPUTestbench() {
+    ~SimplePipelineTestbench() {
+        delete fetch_stage;
+        delete decode_stage;
         delete execute_stage;
+        delete writeback_stage;
     }
 };
 
 // ========== MAIN FUNCTION ==========
 int sc_main(int argc, char* argv[]) {
-    cout << "=== DIRECT EXECUTE STAGE FPU VERIFICATION ===" << endl;
-    cout << "Tests: FADD, FSUB, FMUL, FDIV operations with real operands" << endl;
-    cout << endl;
+    cout << "=== SIMPLE 4-STAGE FPU PIPELINE ===" << endl;
+    cout << "Testing: FADD, FSUB, FMUL with 3 test cases" << endl;
     
-    ExecuteFPUTestbench testbench("execute_fpu_testbench");
-
-    // Start simulation
+    SimplePipelineTestbench testbench("pipeline_testbench");
+    
     try {
         sc_start();
-        cout << "\n✅ Simulation completed successfully!" << endl;
+        cout << "\n✅ Pipeline simulation completed!" << endl;
     } catch (const exception& e) {
         cout << "\n❌ Simulation error: " << e.what() << endl;
         return 1;
