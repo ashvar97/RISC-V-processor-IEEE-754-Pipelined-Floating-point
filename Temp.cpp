@@ -7,17 +7,23 @@
 #include <string>
 #include <cstring>
 #include "design.cpp"
-#include <systemc.h>
 #include <iostream>
-#include <iomanip>
-#include <cmath>
-#include <string>
-#include <vector>
-
-// Forward declarations for FPU modules (assume they are defined elsewhere)
-// Include your existing FPU modules here or link them separately
+using namespace std;
 
 
+// Helper function to convert float to IEEE 754 format
+sc_uint<32> float_to_ieee754(float f) {
+    union { float f; uint32_t i; } u;
+    u.f = f;
+    return sc_uint<32>(u.i);
+}
+
+// Helper function to convert IEEE 754 to float
+float ieee754_to_float(sc_uint<32> ieee) {
+    union { float f; uint32_t i; } u;
+    u.i = ieee.to_uint();
+    return u.f;
+}
 
 // Instruction formats and opcodes
 enum fp_opcode_t {
@@ -56,7 +62,7 @@ struct fp_instruction_t {
 };
 
 
-// ========== STAGE 3: EXECUTE (Updated for Pipelined Adder) ==========
+// ========== STAGE 3: EXECUTE (RV32F focused) ==========
 SC_MODULE(Execute) {
     // Clock and control
     sc_in<bool> clk;
@@ -77,8 +83,6 @@ SC_MODULE(Execute) {
     sc_out<sc_uint<4>> opcode_out;
     sc_out<sc_uint<5>> rd_out;
     sc_out<sc_uint<32>> result_out;
-    sc_out<sc_uint<32>> store_data_out;
-    sc_out<sc_uint<13>> memory_addr_out;
     sc_out<bool> valid_out;
     
     // FPU status outputs
@@ -87,15 +91,15 @@ SC_MODULE(Execute) {
     sc_out<bool> fpu_divide_by_zero;
 
 private:
-    // FPU instances - Using your new pipelined adder
+    // FPU instances - Using pipelined units
     ieee754mult *fpu_mult;
-    ieee754add *fpu_add;  // Updated to use pipelined version
+    ieee754add *fpu_add;
     ieee754_subtractor *fpu_sub;
     ieee754div *fpu_div;
     
     // Internal signals for FPU operations
     sc_signal<sc_uint<32>> fpu_a, fpu_b;
-    sc_signal<bool> fpu_valid_in;  // Added for pipelined adder
+    sc_signal<bool> fpu_valid_in;
     sc_signal<sc_uint<32>> mult_result, add_result, sub_result, div_result;
     sc_signal<bool> mult_valid, add_valid, sub_valid, div_valid;
     sc_signal<bool> mult_overflow, mult_underflow;
@@ -103,18 +107,12 @@ private:
     sc_signal<bool> sub_overflow, sub_underflow;
     sc_signal<bool> div_overflow, div_underflow, div_by_zero;
     
-    // Opcode definitions
+    // RV32F opcodes
     enum opcodes {
-        OP_NOP = 0x0,
-        OP_ADD_INT = 0x1,
-        OP_SUB_INT = 0x2,
-        OP_LOAD = 0x3,
-        OP_STORE = 0x4,
-        OP_FADD = 0x5,    // Floating-point add
-        OP_FSUB = 0x6,    // Floating-point subtract
-        OP_FMUL = 0x7,    // Floating-point multiply
-        OP_FDIV = 0x8,    // Floating-point divide
-        OP_BRANCH = 0x9
+        OP_FADD = 0x0,
+        OP_FSUB = 0x1,
+        OP_FMUL = 0x2,
+        OP_FDIV = 0x3
     };
 
 public:
@@ -124,8 +122,6 @@ public:
             opcode_out.write(0);
             rd_out.write(0);
             result_out.write(0);
-            store_data_out.write(0);
-            memory_addr_out.write(0);
             valid_out.write(false);
             fpu_overflow.write(false);
             fpu_underflow.write(false);
@@ -145,91 +141,66 @@ public:
             // Set FPU inputs
             fpu_a.write(op1);
             fpu_b.write(op2);
+            fpu_valid_in.write(true); // Always valid for RV32F operations
             
-            // Enable FPU operation for floating-point instructions
-            bool is_fp_op = (opcode.to_uint() >= OP_FADD && opcode.to_uint() <= OP_FDIV);
-            fpu_valid_in.write(is_fp_op);
-            
-            switch (opcode.to_uint()) {
-                case OP_ADD_INT:
-                    result = op1 + op2;
-                    break;
-                    
-                case OP_SUB_INT:
-                    result = op1 - op2;
-                    break;
-                    
-                case OP_LOAD:
-                    result = op1 + immediate_in.read(); // Address calculation
-                    break;
-                    
-                case OP_STORE:
-                    result = op1 + immediate_in.read(); // Address calculation
-                    store_data_out.write(op2);
-                    break;
-                    
+            switch (opcode.to_uint()) {                    
                 case OP_FADD:
-                    result = add_result.read(); // Will be valid after pipeline delay
+                    result = add_result.read();
                     fpu_overflow.write(add_overflow.read());
                     fpu_underflow.write(add_underflow.read());
                     break;
                     
                 case OP_FSUB:
-                    result = sub_result.read(); // Will be valid after pipeline delay
+                    result = sub_result.read();
                     fpu_overflow.write(sub_overflow.read());
                     fpu_underflow.write(sub_underflow.read());
                     break;
                     
                 case OP_FMUL:
-                    result = mult_result.read(); // Will be valid after pipeline delay
+                    result = mult_result.read();
                     fpu_overflow.write(mult_overflow.read());
                     fpu_underflow.write(mult_underflow.read());
                     break;
                     
                 case OP_FDIV:
-                    result = div_result.read(); // Will be valid after pipeline delay
+                    result = div_result.read();
                     fpu_overflow.write(div_overflow.read());
                     fpu_underflow.write(div_underflow.read());
                     fpu_divide_by_zero.write(div_by_zero.read());
                     break;
                     
-                case OP_BRANCH:
-                    result = pc_in.read() + (immediate_in.read() << 2);
-                    break;
-                    
-                default: // OP_NOP
+                default: // Invalid opcode
                     result = 0;
+                    fpu_valid_in.write(false);
                     break;
             }
             
-            // Output results - for FP operations, check if result is valid
+            // Output results
             pc_out.write(pc_in.read());
             opcode_out.write(opcode);
             rd_out.write(rd_in.read());
             result_out.write(result);
-            memory_addr_out.write(result.range(12, 0));
             
             // For pipelined FP operations, output is valid when FPU says it's valid
-            if (is_fp_op) {
-                bool fp_result_valid = false;
-                switch (opcode.to_uint()) {
-                    case OP_FADD:
-                        fp_result_valid = add_valid.read();
-                        break;
-                    case OP_FSUB:
-                        fp_result_valid = sub_valid.read();
-                        break;
-                    case OP_FMUL:
-                        fp_result_valid = mult_valid.read();
-                        break;
-                    case OP_FDIV:
-                        fp_result_valid = div_valid.read();
-                        break;
-                }
-                valid_out.write(fp_result_valid);
-            } else {
-                valid_out.write(true); // Integer operations complete immediately
+            bool fp_result_valid = false;
+            switch (opcode.to_uint()) {
+                case OP_FADD:
+                    fp_result_valid = add_valid.read();
+                    break;
+                case OP_FSUB:
+                    fp_result_valid = sub_valid.read();
+                    break;
+                case OP_FMUL:
+                    fp_result_valid = mult_valid.read();
+                    break;
+                case OP_FDIV:
+                    fp_result_valid = div_valid.read();
+                    break;
+                default:
+                    fp_result_valid = false;
+                    break;
             }
+            valid_out.write(fp_result_valid);
         } else {
             valid_out.write(false);
             fpu_valid_in.write(false);
@@ -237,9 +208,9 @@ public:
     }
 
     SC_CTOR(Execute) {
-        // Instantiate FPU units with correct port connections
+        // Instantiate FPU units
         
-        // Multiplier (assuming it has similar interface)
+        // Multiplier
         fpu_mult = new ieee754mult("fpu_mult");
         fpu_mult->A(fpu_a);
         fpu_mult->B(fpu_b);
@@ -250,19 +221,19 @@ public:
         fpu_mult->overflow(mult_overflow);
         fpu_mult->underflow(mult_underflow);
         
-        // Pipelined Adder - using your new interface
+        // Pipelined Adder
         fpu_add = new ieee754add("fpu_add");
         fpu_add->clk(clk);
         fpu_add->reset(reset);
         fpu_add->A(fpu_a);
         fpu_add->B(fpu_b);
-        fpu_add->valid_in(fpu_valid_in);  // Connect the valid_in signal
+        fpu_add->valid_in(fpu_valid_in);
         fpu_add->result(add_result);
         fpu_add->valid_out(add_valid);
         fpu_add->overflow(add_overflow);
         fpu_add->underflow(add_underflow);
         
-        // Subtractor (assuming similar interface to old adder)
+        // Subtractor
         fpu_sub = new ieee754_subtractor("fpu_sub");
         fpu_sub->A(fpu_a);
         fpu_sub->B(fpu_b);
@@ -273,7 +244,7 @@ public:
         fpu_sub->overflow(sub_overflow);
         fpu_sub->underflow(sub_underflow);
         
-        // Divider (assuming similar interface)
+        // Divider
         fpu_div = new ieee754div("fpu_div");
         fpu_div->a(fpu_a);
         fpu_div->b(fpu_b);
@@ -287,7 +258,7 @@ public:
         
         SC_METHOD(execute_process);
         sensitive << clk.pos() << reset << stall << valid_in << opcode_in 
-                 << operand1_in << operand2_in << immediate_in << rd_in << pc_in
+                 << operand1_in << operand2_in << rd_in << pc_in
                  << mult_result << add_result << sub_result << div_result
                  << mult_valid << add_valid << sub_valid << div_valid
                  << mult_overflow << mult_underflow << add_overflow << add_underflow
@@ -302,38 +273,6 @@ public:
     }
 };
 
-
-// Helper function to convert float to IEEE 754 format
-sc_uint<32> float_to_ieee754(float f) {
-    union { float f; uint32_t i; } u;
-    u.f = f;
-    return sc_uint<32>(u.i);
-}
-
-// Helper function to convert IEEE 754 to float
-float ieee754_to_float(sc_uint<32> ieee) {
-    union { float f; uint32_t i; } u;
-    u.i = ieee.to_uint();
-    return u.f;
-}
-
-#include <systemc.h>
-#include <iostream>
-#include <iomanip>
-#include <cmath>
-#include <string>
-#include <vector>
-
-
-
-#include <systemc.h>
-#include <iostream>
-#include <iomanip>
-#include <cmath>
-#include <string>
-#include <vector>
-
-using namespace std;
 
 
 // ========== DIRECT EXECUTE STAGE FPU TESTBENCH ==========
@@ -350,10 +289,9 @@ SC_MODULE(ExecuteFPUTestbench) {
     sc_signal<bool> valid_in;
     
     // Execute stage outputs
-    sc_signal<sc_uint<32>> pc_out, result_out, store_data_out;
+    sc_signal<sc_uint<32>> pc_out, result_out;
     sc_signal<sc_uint<4>> opcode_out;
     sc_signal<sc_uint<5>> rd_out;
-    sc_signal<sc_uint<13>> memory_addr_out;
     sc_signal<bool> valid_out;
     sc_signal<bool> fpu_overflow, fpu_underflow, fpu_divide_by_zero;
     
@@ -475,9 +413,9 @@ SC_MODULE(ExecuteFPUTestbench) {
              << "B=" << test.b << " (0x" << hex << float_to_ieee754(test.b).to_uint() << dec << ")" << endl;
         
         // Test the three FPU operations
-        test_fpu_operation(0x5, test.a, test.b, test.expected_add, "FADD");
-        test_fpu_operation(0x6, test.a, test.b, test.expected_sub, "FSUB");
-        test_fpu_operation(0x7, test.a, test.b, test.expected_mult, "FMUL");
+        test_fpu_operation(0x0, test.a, test.b, test.expected_add, "FADD");
+        test_fpu_operation(0x1, test.a, test.b, test.expected_sub, "FSUB");
+        test_fpu_operation(0x2, test.a, test.b, test.expected_mult, "FMUL");
     }
     
     void run_comprehensive_fpu_tests() {
@@ -487,34 +425,6 @@ SC_MODULE(ExecuteFPUTestbench) {
             execute_fpu_test_case(fpu_tests[i]);
             wait(20, SC_NS); // Brief pause between test cases
         }
-    }
-    
-    void test_integer_operations() {
-        cout << "\n--- Testing Integer Operations for Comparison ---" << endl;
-        
-        // Test integer addition
-        cout << "\nTesting Integer ADD: 42 + 58 = 100" << endl;
-        pc_in.write(0x2000);
-        opcode_in.write(0x1); // OP_ADD_INT
-        operand1_in.write(42);
-        operand2_in.write(58);
-        valid_in.write(true);
-        stall.write(false);
-        
-        wait(20, SC_NS);
-        
-        if (valid_out.read()) {
-            sc_uint<32> result = result_out.read();
-            bool passed = (result.to_uint() == 100);
-            cout << "    Integer ADD: " << result.to_uint() << " (expected: 100) - " 
-                 << (passed ? "PASS" : "FAIL") << endl;
-            if (passed) tests_passed++;
-            else tests_failed++;
-            total_tests++;
-        }
-        
-        valid_in.write(false);
-        wait(10, SC_NS);
     }
     
     void print_test_summary() {
@@ -558,9 +468,6 @@ SC_MODULE(ExecuteFPUTestbench) {
         // Run comprehensive FPU tests
         run_comprehensive_fpu_tests();
         
-        // Test integer operations for comparison
-        test_integer_operations();
-        
         // Print final results
         print_test_summary();
         
@@ -585,8 +492,6 @@ SC_MODULE(ExecuteFPUTestbench) {
         execute_stage->opcode_out(opcode_out);
         execute_stage->rd_out(rd_out);
         execute_stage->result_out(result_out);
-        execute_stage->store_data_out(store_data_out);
-        execute_stage->memory_addr_out(memory_addr_out);
         execute_stage->valid_out(valid_out);
         execute_stage->fpu_overflow(fpu_overflow);
         execute_stage->fpu_underflow(fpu_underflow);
@@ -603,27 +508,11 @@ SC_MODULE(ExecuteFPUTestbench) {
 // ========== MAIN FUNCTION ==========
 int sc_main(int argc, char* argv[]) {
     cout << "=== DIRECT EXECUTE STAGE FPU VERIFICATION ===" << endl;
-    cout << "This testbench directly tests the FPU units in the Execute stage" << endl;
-    cout << "Bypasses instruction fetch/decode complexities" << endl;
     cout << "Tests: FADD, FSUB, FMUL, FDIV operations with real operands" << endl;
     cout << endl;
     
     ExecuteFPUTestbench testbench("execute_fpu_testbench");
-    
-    // Enable waveform tracing
-    sc_trace_file *tf = sc_create_vcd_trace_file("execute_stage_fpu_test");
-    sc_trace(tf, testbench.clk, "clk");
-    sc_trace(tf, testbench.reset, "reset");
-    sc_trace(tf, testbench.opcode_in, "opcode_in");
-    sc_trace(tf, testbench.operand1_in, "operand1_in");
-    sc_trace(tf, testbench.operand2_in, "operand2_in");
-    sc_trace(tf, testbench.valid_in, "valid_in");
-    sc_trace(tf, testbench.result_out, "result_out");
-    sc_trace(tf, testbench.valid_out, "valid_out");
-    sc_trace(tf, testbench.fpu_overflow, "fpu_overflow");
-    sc_trace(tf, testbench.fpu_underflow, "fpu_underflow");
-    sc_trace(tf, testbench.fpu_divide_by_zero, "fpu_divide_by_zero");
-    
+
     // Start simulation
     try {
         sc_start();
@@ -632,11 +521,5 @@ int sc_main(int argc, char* argv[]) {
         cout << "\n❌ Simulation error: " << e.what() << endl;
         return 1;
     }
-    
-    sc_close_vcd_trace_file(tf);
-    
-    cout << "\n📊 Check the summary above for FPU unit verification results!" << endl;
-    cout << "📈 Waveform file 'execute_stage_fpu_test.vcd' generated" << endl;
-    
     return 0;
 }
