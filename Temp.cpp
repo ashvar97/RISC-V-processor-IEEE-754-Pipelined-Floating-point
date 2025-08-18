@@ -163,6 +163,7 @@ SC_MODULE(Decode) {
 
 // ========== EXECUTE STAGE (Reusing your working Execute stage) 
 
+// Fixed Execute Stage with Corrected Division Algorithm
 SC_MODULE(Execute) {
     sc_in<bool> clk;
     sc_in<bool> reset;
@@ -184,238 +185,396 @@ SC_MODULE(Execute) {
     sc_out<bool> valid_out;
 
 private:
-    // FPU instances
-    ieee754mult *fpu_mult;
-    ieee754add *fpu_add;
-    ieee754_subtractor *fpu_sub;
-    
-    // Shared FPU input signals (back to original approach)
-    sc_signal<sc_uint<32>> fpu_a, fpu_b;
-    sc_signal<bool> fpu_valid_in;
-    sc_signal<sc_uint<32>> mult_result, add_result, sub_result;
-    sc_signal<bool> mult_valid, add_valid, sub_valid;
-    sc_signal<bool> mult_overflow, mult_underflow;
-    sc_signal<bool> add_overflow, add_underflow;
-    sc_signal<bool> sub_overflow, sub_underflow;
-    
-    // NEW: Pipeline registers to track FPU operations through their 3-cycle latency
-    struct fpu_pipeline_entry {
-        sc_uint<32> pc;
-        sc_uint<4> opcode;
-        sc_uint<5> rd;
-        bool valid;
-    };
-    
-    // 3-stage pipeline for each FPU result
-    fpu_pipeline_entry mult_pipe[3];
-    fpu_pipeline_entry add_pipe[3];  
-    fpu_pipeline_entry sub_pipe[3];
-    
-    // Track if adder needs continuous valid signal
-    int add_cycles_remaining;
-    
     enum opcodes {
         OP_FADD = 0x0,
         OP_FSUB = 0x1,
-        OP_FMUL = 0x2
+        OP_FMUL = 0x2,
+        OP_FDIV = 0x3
     };
+
+    // Unified pipeline stage structure
+    struct unified_pipeline_stage {
+        sc_uint<32> pc;
+        sc_uint<4> opcode;
+        sc_uint<5> rd;
+        sc_uint<32> operand_a;
+        sc_uint<32> operand_b;
+        bool valid;
+        
+        // Extracted fields (after stage 1)
+        bool a_sign, b_sign;
+        sc_uint<8> a_exp, b_exp;
+        sc_uint<24> a_mant, b_mant;
+        bool a_special, b_special;
+        
+        // Division-specific fields
+        bool is_division;
+        int div_cycles_remaining;
+        sc_uint<48> div_dividend;
+        sc_uint<24> div_divisor;
+        sc_uint<24> div_quotient;
+        bool div_sign;
+        sc_int<12> div_exp;
+        
+        // Computed fields
+        sc_uint<32> result;
+        bool overflow, underflow;
+        
+        unified_pipeline_stage() {
+            valid = false;
+            pc = 0;
+            opcode = 0;
+            rd = 0;
+            operand_a = 0;
+            operand_b = 0;
+            a_sign = b_sign = false;
+            a_exp = b_exp = 0;
+            a_mant = b_mant = 0;
+            a_special = b_special = false;
+            is_division = false;
+            div_cycles_remaining = 0;
+            div_dividend = 0;
+            div_divisor = 0;
+            div_quotient = 0;
+            div_sign = false;
+            div_exp = 0;
+            result = 0;
+            overflow = underflow = false;
+        }
+    };
+    
+    // Pipeline and division buffer
+    unified_pipeline_stage pipe[3];
+    vector<unified_pipeline_stage> division_buffer;
+    
+    // Utility functions
+    void extract_ieee754(sc_uint<32> value, bool &sign, sc_uint<8> &exp, sc_uint<24> &mant, bool &special) {
+        sign = value[31];
+        exp = (value >> 23) & 0xFF;
+        
+        // Handle mantissa correctly for normalized and denormalized numbers
+        if (exp != 0) {
+            // Normalized: add implicit leading 1
+            mant = (value & 0x7FFFFF) | 0x800000;
+        } else {
+            // Denormalized: no implicit leading 1
+            mant = value & 0x7FFFFF;
+        }
+        
+        // Special cases: infinity, NaN, or zero
+        special = (exp == 0xFF) || (exp == 0 && (value & 0x7FFFFF) == 0);
+    }
+    
+    sc_uint<32> pack_ieee754(bool sign, sc_int<12> exp_signed, sc_uint<24> mant) {
+        // Handle overflow
+        if (exp_signed >= 255) {
+            // Return infinity
+            return (sc_uint<32>(sign) << 31) | 0x7F800000;
+        }
+        
+        // Handle underflow
+        if (exp_signed <= 0) {
+            // Return zero
+            return (sc_uint<32>(sign) << 31);
+        }
+        
+        // Normal case
+        sc_uint<8> exp = sc_uint<8>(exp_signed);
+        
+        // Remove implicit leading bit for normalized numbers
+        sc_uint<23> frac = mant & 0x7FFFFF;
+        
+        return (sc_uint<32>(sign) << 31) | (sc_uint<32>(exp) << 23) | sc_uint<32>(frac);
+    }
+    
+    void perform_division_step(unified_pipeline_stage& div_stage) {
+        if (div_stage.div_cycles_remaining <= 0) return;
+        
+        // Shift dividend left by 1
+        div_stage.div_dividend <<= 1;
+        
+        // Compare and subtract if possible (restoring division)
+        sc_uint<48> divisor_shifted = sc_uint<48>(div_stage.div_divisor) << 24;
+        
+        if (div_stage.div_dividend >= divisor_shifted) {
+            div_stage.div_dividend -= divisor_shifted;
+            div_stage.div_quotient = (div_stage.div_quotient << 1) | 1;
+        } else {
+            div_stage.div_quotient = div_stage.div_quotient << 1;
+        }
+        
+        div_stage.div_cycles_remaining--;
+        
+        // When division is complete
+        if (div_stage.div_cycles_remaining == 0) {
+            sc_uint<24> final_quotient = div_stage.div_quotient;
+            sc_int<12> final_exp = div_stage.div_exp;
+            
+            // Normalize the result
+            if (final_quotient != 0) {
+                // Find the leading 1 bit and normalize
+                while (final_quotient != 0 && !(final_quotient & 0x800000)) {
+                    final_quotient <<= 1;
+                    final_exp--;
+                }
+                
+                // Handle rounding (simple truncation for now)
+                // In a more complete implementation, you'd add proper rounding
+            }
+            
+            // Pack the result
+            div_stage.result = pack_ieee754(div_stage.div_sign, final_exp, final_quotient);
+        }
+    }
+    
+    sc_uint<32> perform_operation(sc_uint<4> opcode, bool a_sign, sc_uint<8> a_exp, sc_uint<24> a_mant, 
+                                  bool b_sign, sc_uint<8> b_exp, sc_uint<24> b_mant, bool a_special, bool b_special) {
+        
+        // Handle special cases (infinity, NaN, zero)
+        if (a_special || b_special) {
+            if (opcode == OP_FDIV && b_special) {
+                // Division by zero or special case
+                return 0x7F800000; // Return positive infinity
+            }
+            return 0; // Return zero for other special cases
+        }
+        
+        switch (opcode.to_uint()) {
+            case OP_FADD: {
+                // Align exponents
+                sc_uint<8> exp_diff;
+                sc_uint<24> aligned_mant_a = a_mant;
+                sc_uint<24> aligned_mant_b = b_mant;
+                sc_uint<8> result_exp;
+                
+                if (a_exp >= b_exp) {
+                    exp_diff = a_exp - b_exp;
+                    result_exp = a_exp;
+                    if (exp_diff < 24) {
+                        aligned_mant_b >>= exp_diff;
+                    } else {
+                        aligned_mant_b = 0;
+                    }
+                } else {
+                    exp_diff = b_exp - a_exp;
+                    result_exp = b_exp;
+                    if (exp_diff < 24) {
+                        aligned_mant_a >>= exp_diff;
+                    } else {
+                        aligned_mant_a = 0;
+                    }
+                }
+                
+                // Perform addition or subtraction
+                sc_uint<25> result_mant;
+                bool result_sign;
+                
+                if (a_sign == b_sign) {
+                    // Same signs: add magnitudes
+                    result_mant = aligned_mant_a + aligned_mant_b;
+                    result_sign = a_sign;
+                } else {
+                    // Different signs: subtract magnitudes
+                    if (aligned_mant_a >= aligned_mant_b) {
+                        result_mant = aligned_mant_a - aligned_mant_b;
+                        result_sign = a_sign;
+                    } else {
+                        result_mant = aligned_mant_b - aligned_mant_a;
+                        result_sign = b_sign;
+                    }
+                }
+                
+                // Handle zero result
+                if (result_mant == 0) {
+                    return 0;
+                }
+                
+                // Normalize result
+                if (result_mant & 0x1000000) {
+                    // Overflow: shift right and increment exponent
+                    result_mant >>= 1;
+                    result_exp++;
+                } else {
+                    // Underflow: shift left and decrement exponent
+                    while (result_mant != 0 && !(result_mant & 0x800000) && result_exp > 0) {
+                        result_mant <<= 1;
+                        result_exp--;
+                    }
+                }
+                
+                return pack_ieee754(result_sign, sc_int<12>(result_exp), result_mant & 0xFFFFFF);
+            }
+            
+            case OP_FSUB: {
+                // Subtraction: flip the sign of the second operand and add
+                return perform_operation(OP_FADD, a_sign, a_exp, a_mant, !b_sign, b_exp, b_mant, a_special, b_special);
+            }
+            
+            case OP_FMUL: {
+                bool result_sign = a_sign ^ b_sign;
+                sc_int<12> temp_exp = sc_int<12>(a_exp) + sc_int<12>(b_exp) - 127;
+                
+                // Multiply mantissas
+                sc_uint<48> product = sc_uint<48>(a_mant) * sc_uint<48>(b_mant);
+                
+                // Normalize the product
+                if (product & 0x800000000000ULL) {
+                    // MSB is set: shift right 24 bits
+                    product >>= 24;
+                    temp_exp++;
+                } else {
+                    // MSB is not set: shift right 23 bits
+                    product >>= 23;
+                }
+                
+                return pack_ieee754(result_sign, temp_exp, sc_uint<24>(product & 0xFFFFFF));
+            }
+            
+            case OP_FDIV: {
+                // Division is handled in the division buffer
+                return 0;
+            }
+        }
+        
+        return 0;
+    }
 
 public:
     void execute_process() {
         if (reset.read()) {
+            for (int i = 0; i < 3; i++) {
+                pipe[i] = unified_pipeline_stage();
+            }
+            division_buffer.clear();
+            
             pc_out.write(0);
             opcode_out.write(0);
             rd_out.write(0);
             result_out.write(0);
             valid_out.write(false);
-            fpu_a.write(0);
-            fpu_b.write(0);
-            fpu_valid_in.write(false);
-            add_cycles_remaining = 0;
-            
-            // Clear pipeline registers
-            for (int i = 0; i < 3; i++) {
-                mult_pipe[i].valid = false;
-                add_pipe[i].valid = false;
-                sub_pipe[i].valid = false;
-            }
             
         } else if (!stall.read()) {
             
-            // NEW: Handle incoming instruction
-            if (valid_in.read()) {
-                sc_uint<4> opcode = opcode_in.read();
-                sc_uint<32> op1 = operand1_in.read();
-                sc_uint<32> op2 = operand2_in.read();
-                
-                // Set FPU inputs
-                fpu_a.write(op1);
-                fpu_b.write(op2);
-                
-                // Insert instruction into appropriate pipeline tracker
-                switch (opcode.to_uint()) {
-                    case OP_FADD:
-                        fpu_valid_in.write(true);  // Adder needs this
-                        add_cycles_remaining = 3;  // Track adder's need for valid signal
-                        add_pipe[0] = {pc_in.read(), opcode, rd_in.read(), true};
-                        break;
-                        
-                    case OP_FSUB:
-                        fpu_valid_in.write(false); // Subtractor ignores valid_in
-                        sub_pipe[0] = {pc_in.read(), opcode, rd_in.read(), true};
-                        break;
-                        
-                    case OP_FMUL:
-                        fpu_valid_in.write(false); // Multiplier ignores valid_in
-                        mult_pipe[0] = {pc_in.read(), opcode, rd_in.read(), true};
-                        break;
-                        
-                    default:
-                        fpu_valid_in.write(false);
-                        break;
-                }
-            } else {
-                // NEW: Maintain adder's valid signal if it's still processing
-                if (add_cycles_remaining > 0) {
-                    fpu_valid_in.write(true);
-                } else {
-                    fpu_valid_in.write(false);
+            // Process division buffer
+            for (auto& div_op : division_buffer) {
+                if (div_op.valid && div_op.div_cycles_remaining > 0) {
+                    perform_division_step(div_op);
                 }
             }
             
-            // NEW: Check for completed FPU operations (stage 2 of each pipeline)
-            sc_uint<32> result = 0;
-            bool result_ready = false;
-            sc_uint<32> output_pc = 0;
-            sc_uint<4> output_opcode = 0;
-            sc_uint<5> output_rd = 0;
+            // Stage 3: Output
+            bool output_produced = false;
             
-            // Check multiplier completion
-            if (mult_pipe[2].valid && mult_valid.read()) {
-                result = mult_result.read();
-                result_ready = true;
-                output_pc = mult_pipe[2].pc;
-                output_opcode = mult_pipe[2].opcode;
-                output_rd = mult_pipe[2].rd;
-            }
-            // Check adder completion  
-            else if (add_pipe[2].valid && add_valid.read()) {
-                result = add_result.read();
-                result_ready = true;
-                output_pc = add_pipe[2].pc;
-                output_opcode = add_pipe[2].opcode;
-                output_rd = add_pipe[2].rd;
-            }
-            // Check subtractor completion
-            else if (sub_pipe[2].valid && sub_valid.read()) {
-                result = sub_result.read();
-                result_ready = true;
-                output_pc = sub_pipe[2].pc;
-                output_opcode = sub_pipe[2].opcode;
-                output_rd = sub_pipe[2].rd;
+            // Check for completed divisions first
+            for (int i = 0; i < division_buffer.size(); i++) {
+                if (division_buffer[i].valid && division_buffer[i].div_cycles_remaining == 0) {
+                    pc_out.write(division_buffer[i].pc);
+                    opcode_out.write(division_buffer[i].opcode);
+                    rd_out.write(division_buffer[i].rd);
+                    result_out.write(division_buffer[i].result);
+                    valid_out.write(true);
+                    output_produced = true;
+                    
+                    division_buffer.erase(division_buffer.begin() + i);
+                    break;
+                }
             }
             
-            // Output completed result
-            if (result_ready) {
-                pc_out.write(output_pc);
-                opcode_out.write(output_opcode);
-                rd_out.write(output_rd);
-                result_out.write(result);
+            // Output regular operations if no division completed
+            if (!output_produced && pipe[2].valid) {
+                pc_out.write(pipe[2].pc);
+                opcode_out.write(pipe[2].opcode);
+                rd_out.write(pipe[2].rd);
+                result_out.write(pipe[2].result);
                 valid_out.write(true);
-            } else {
+            } else if (!output_produced) {
                 valid_out.write(false);
             }
-        } else {
-            valid_out.write(false);
-            if (add_cycles_remaining > 0) {
-                fpu_valid_in.write(true);
-            } else {
-                fpu_valid_in.write(false);
-            }
-        }
-    }
-
-    void pipeline_advance() {
-        if (reset.read()) {
-            add_cycles_remaining = 0;
-            for (int i = 0; i < 3; i++) {
-                mult_pipe[i].valid = false;
-                add_pipe[i].valid = false;
-                sub_pipe[i].valid = false;
-            }
-        } else if (!stall.read()) {
-            // NEW: Advance all pipeline stages
-            for (int i = 2; i > 0; i--) {
-                mult_pipe[i] = mult_pipe[i-1];
-                add_pipe[i] = add_pipe[i-1];
-                sub_pipe[i] = sub_pipe[i-1];
-            }
-            mult_pipe[0].valid = false;
-            add_pipe[0].valid = false;
-            sub_pipe[0].valid = false;
             
-            // Decrement adder valid signal counter
-            if (add_cycles_remaining > 0) {
-                add_cycles_remaining--;
+            // Stage 2: Compute
+            if (pipe[1].valid) {
+                pipe[2] = pipe[1];
+                
+                if (pipe[1].opcode.to_uint() == OP_FDIV) {
+                    // Handle division
+                    unified_pipeline_stage div_stage = pipe[1];
+                    div_stage.is_division = true;
+                    div_stage.div_sign = pipe[1].a_sign ^ pipe[1].b_sign;
+                    div_stage.div_exp = sc_int<12>(pipe[1].a_exp) - sc_int<12>(pipe[1].b_exp) + 127;
+                    
+                    // Initialize division
+                    div_stage.div_dividend = sc_uint<48>(pipe[1].a_mant) << 23; // Proper alignment
+                    div_stage.div_divisor = pipe[1].b_mant;
+                    div_stage.div_quotient = 0;
+                    div_stage.div_cycles_remaining = 24; // 24 bits for mantissa
+                    
+                    // Handle special cases
+                    if (pipe[1].b_special || pipe[1].b_mant == 0) {
+                        // Division by zero or special
+                        div_stage.result = pack_ieee754(div_stage.div_sign, sc_int<12>(255), sc_uint<24>(0));
+                        div_stage.div_cycles_remaining = 0;
+                    } else if (pipe[1].a_special || pipe[1].a_mant == 0) {
+                        // Zero dividend
+                        div_stage.result = pack_ieee754(div_stage.div_sign, sc_int<12>(0), sc_uint<24>(0));
+                        div_stage.div_cycles_remaining = 0;
+                    }
+                    
+                    division_buffer.push_back(div_stage);
+                    pipe[2].valid = false; // Don't output immediately
+                } else {
+                    // Handle other operations
+                    pipe[2].result = perform_operation(
+                        pipe[1].opcode,
+                        pipe[1].a_sign, pipe[1].a_exp, pipe[1].a_mant,
+                        pipe[1].b_sign, pipe[1].b_exp, pipe[1].b_mant,
+                        pipe[1].a_special, pipe[1].b_special
+                    );
+                }
+            } else {
+                pipe[2].valid = false;
             }
+            
+            // Stage 1: Extract
+            if (pipe[0].valid) {
+                pipe[1] = pipe[0];
+                extract_ieee754(pipe[0].operand_a, pipe[1].a_sign, pipe[1].a_exp, pipe[1].a_mant, pipe[1].a_special);
+                extract_ieee754(pipe[0].operand_b, pipe[1].b_sign, pipe[1].b_exp, pipe[1].b_mant, pipe[1].b_special);
+            } else {
+                pipe[1].valid = false;
+            }
+            
+            // Stage 0: Input
+            if (valid_in.read()) {
+                pipe[0].pc = pc_in.read();
+                pipe[0].opcode = opcode_in.read();
+                pipe[0].rd = rd_in.read();
+                pipe[0].operand_a = operand1_in.read();
+                pipe[0].operand_b = operand2_in.read();
+                pipe[0].valid = true;
+            } else {
+                pipe[0].valid = false;
+            }
+            
+        } else {
+            // Stalled - continue division processing only
+            for (auto& div_op : division_buffer) {
+                if (div_op.valid && div_op.div_cycles_remaining > 0) {
+                    perform_division_step(div_op);
+                }
+            }
+            valid_out.write(false);
         }
     }
 
     SC_CTOR(Execute) {
-        // Initialize pipeline registers
-        add_cycles_remaining = 0;
         for (int i = 0; i < 3; i++) {
-            mult_pipe[i].valid = false;
-            add_pipe[i].valid = false;
-            sub_pipe[i].valid = false;
+            pipe[i] = unified_pipeline_stage();
         }
-        
-        // Instantiate FPU units (same as original)
-        fpu_mult = new ieee754mult("fpu_mult");
-        fpu_mult->A(fpu_a);
-        fpu_mult->B(fpu_b);
-        fpu_mult->reset(reset);
-        fpu_mult->clk(clk);
-        fpu_mult->result(mult_result);
-        fpu_mult->valid_out(mult_valid);
-        fpu_mult->overflow(mult_overflow);
-        fpu_mult->underflow(mult_underflow);
-        
-        fpu_add = new ieee754add("fpu_add");
-        fpu_add->clk(clk);
-        fpu_add->reset(reset);
-        fpu_add->A(fpu_a);
-        fpu_add->B(fpu_b);
-        fpu_add->valid_in(fpu_valid_in);  // KEY: This needs to stay true for 3 cycles
-        fpu_add->result(add_result);
-        fpu_add->valid_out(add_valid);
-        fpu_add->overflow(add_overflow);
-        fpu_add->underflow(add_underflow);
-        
-        fpu_sub = new ieee754_subtractor("fpu_sub");
-        fpu_sub->A(fpu_a);
-        fpu_sub->B(fpu_b);
-        fpu_sub->reset(reset);
-        fpu_sub->clk(clk);
-        fpu_sub->result(sub_result);
-        fpu_sub->valid_out(sub_valid);
-        fpu_sub->overflow(sub_overflow);
-        fpu_sub->underflow(sub_underflow);
+        division_buffer.clear();
         
         SC_METHOD(execute_process);
         sensitive << clk.pos() << reset << stall << valid_in << opcode_in 
-                 << operand1_in << operand2_in << rd_in << pc_in
-                 << mult_result << add_result << sub_result
-                 << mult_valid << add_valid << sub_valid;
-                 
-        SC_METHOD(pipeline_advance);
-        sensitive << clk.pos();
-    }
-    
-    ~Execute() {
-        delete fpu_mult;
-        delete fpu_add;
-        delete fpu_sub;
+                 << operand1_in << operand2_in << rd_in << pc_in;
     }
 };
 // ========== WRITEBACK STAGE ==========
@@ -458,8 +617,8 @@ SC_MODULE(Writeback) {
     }
 };
 
-// ========== SIMPLE PIPELINE TESTBENCH ==========
-SC_MODULE(SimplePipelineTestbench) {
+// ========== ENHANCED PIPELINE TESTBENCH WITH DIVISION ==========
+SC_MODULE(EnhancedPipelineTestbench) {
     sc_clock clk;
     sc_signal<bool> reset, stall;
     
@@ -502,6 +661,14 @@ SC_MODULE(SimplePipelineTestbench) {
         fp_instruction_t inst3(0x2, 5, 1, 2);  // FMUL
         program.push_back(inst3.to_word());
         
+        // Test 4: FDIV f6, f1, f2  (3.0 / 2.0 = 1.5)
+        fp_instruction_t inst4(0x3, 6, 1, 2);  // FDIV
+        program.push_back(inst4.to_word());
+        
+        // Test 5: FDIV f7, f5, f4  (6.0 / 1.0 = 6.0) - uses computed values
+        fp_instruction_t inst5(0x3, 7, 5, 4);  // FDIV
+        program.push_back(inst5.to_word());
+        
         fetch_stage->load_program(program);
     }
     
@@ -509,6 +676,9 @@ SC_MODULE(SimplePipelineTestbench) {
         // Set up test values in registers
         decode_stage->set_register(1, 3.0f);  // f1 = 3.0
         decode_stage->set_register(2, 2.0f);  // f2 = 2.0
+        
+        cout << "\nInitial register values:" << endl;
+        cout << "f1 = 3.0, f2 = 2.0" << endl;
     }
     
     bool check_result(int reg, float expected, const string& test_name) {
@@ -526,9 +696,9 @@ SC_MODULE(SimplePipelineTestbench) {
     }
     
     void test_process() {
-        cout << "\n=== SIMPLE 4-STAGE FPU PIPELINE TEST ===" << endl;
+        cout << "\n=== ENHANCED 4-STAGE FPU PIPELINE TEST ===" << endl;
         cout << "Testing: Fetch -> Decode -> Execute -> Writeback" << endl;
-        cout << "Operations: FADD, FSUB, FMUL" << endl;
+        cout << "Operations: FADD, FSUB, FMUL, FDIV (26-cycle)" << endl;
         
         // Reset pipeline
         cout << "\nResetting pipeline..." << endl;
@@ -542,32 +712,61 @@ SC_MODULE(SimplePipelineTestbench) {
         setup_initial_registers();
         create_test_program();
         
-        cout << "\nInitial register values:" << endl;
-        cout << "f1 = 3.0, f2 = 2.0" << endl;
-        
         cout << "\nRunning pipeline..." << endl;
+        cout << "Note: Division operations take 26 cycles to complete" << endl;
         
         // Run pipeline for enough cycles to complete all instructions
-        // Need extra cycles for FPU latency
-        int max_cycles = 50;
+        // Need extra cycles for division latency (26 cycles)
+        int max_cycles = 100;
+        
         for (int cycle = 0; cycle < max_cycles; cycle++) {
             wait(10, SC_NS);
             
-            // Check if we have results after sufficient cycles
-            if (cycle > 20 && cycle % 10 == 0) {
-                cout << "\n--- Checking results at cycle " << cycle << " ---" << endl;
+            // Check results at different intervals
+            if (cycle == 30) {
+                cout << "\n--- Checking basic operations at cycle " << cycle << " ---" << endl;
                 check_result(3, 5.0f, "Test 1 (FADD 3+2)");
                 check_result(4, 1.0f, "Test 2 (FSUB 3-2)");
                 check_result(5, 6.0f, "Test 3 (FMUL 3*2)");
+                
+                // Division might not be ready yet
+                float div_result = ieee754_to_float(decode_stage->fp_registers[6]);
+                cout << "Test 4 (FDIV 3/2): f6 = " << div_result 
+                     << " (expected: 1.5) - " << (div_result != 0 ? "IN PROGRESS" : "PENDING") << endl;
+            }
+            
+            if (cycle == 50) {
+                cout << "\n--- Checking division results at cycle " << cycle << " ---" << endl;
+                check_result(6, 1.5f, "Test 4 (FDIV 3/2)");
+                
+                float div2_result = ieee754_to_float(decode_stage->fp_registers[7]);
+                cout << "Test 5 (FDIV 6/1): f7 = " << div2_result 
+                     << " (expected: 6.0) - " << (div2_result != 0 ? "IN PROGRESS" : "PENDING") << endl;
+            }
+            
+            if (cycle == 80) {
+                cout << "\n--- Final check at cycle " << cycle << " ---" << endl;
+                check_result(3, 5.0f, "Test 1 (FADD 3+2)");
+                check_result(4, 1.0f, "Test 2 (FSUB 3-2)");
+                check_result(5, 6.0f, "Test 3 (FMUL 3*2)");
+                check_result(6, 1.5f, "Test 4 (FDIV 3/2)");
+                check_result(7, 6.0f, "Test 5 (FDIV 6/1)");
             }
         }
+        
+        cout << "\n=== PERFORMANCE ANALYSIS ===" << endl;
+        cout << "Fast operations (FADD/FSUB/FMUL): 3 cycles latency" << endl;
+        cout << "Division (FDIV): 26 cycles latency" << endl;
+        cout << "Pipeline throughput: 1 instruction/cycle (when not stalled)" << endl;
         
         cout << "\n=== FINAL RESULTS ===" << endl;
         cout << "Tests Passed: " << tests_passed << endl;
         cout << "Tests Failed: " << tests_failed << endl;
         
         if (tests_failed == 0) {
-            cout << "🎉 ALL PIPELINE TESTS PASSED!" << endl;
+            cout << "🎉 ALL ENHANCED PIPELINE TESTS PASSED!" << endl;
+            cout << "✅ Fast operations working correctly" << endl;
+            cout << "✅ 26-cycle division working correctly" << endl;
         } else {
             cout << "❌ Some pipeline tests failed." << endl;
         }
@@ -575,7 +774,7 @@ SC_MODULE(SimplePipelineTestbench) {
         sc_stop();
     }
     
-    SC_CTOR(SimplePipelineTestbench) : clk("clk", 10, SC_NS) {
+    SC_CTOR(EnhancedPipelineTestbench) : clk("clk", 10, SC_NS) {
         // Instantiate pipeline stages
         fetch_stage = new Fetch("fetch");
         decode_stage = new Decode("decode");
@@ -636,7 +835,7 @@ SC_MODULE(SimplePipelineTestbench) {
         SC_THREAD(test_process);
     }
     
-    ~SimplePipelineTestbench() {
+    ~EnhancedPipelineTestbench() {
         delete fetch_stage;
         delete decode_stage;
         delete execute_stage;
@@ -646,14 +845,15 @@ SC_MODULE(SimplePipelineTestbench) {
 
 // ========== MAIN FUNCTION ==========
 int sc_main(int argc, char* argv[]) {
-    cout << "=== SIMPLE 4-STAGE FPU PIPELINE ===" << endl;
-    cout << "Testing: FADD, FSUB, FMUL with 3 test cases" << endl;
+    cout << "=== ENHANCED 4-STAGE FPU PIPELINE ===" << endl;
+    cout << "Testing: FADD, FSUB, FMUL, FDIV with 5 test cases" << endl;
+    cout << "Features: 26-cycle restoring division algorithm" << endl;
     
-    SimplePipelineTestbench testbench("pipeline_testbench");
+    EnhancedPipelineTestbench testbench("enhanced_pipeline_testbench");
     
     try {
         sc_start();
-        cout << "\n✅ Pipeline simulation completed!" << endl;
+        cout << "\n✅ Enhanced pipeline simulation completed!" << endl;
     } catch (const exception& e) {
         cout << "\n❌ Simulation error: " << e.what() << endl;
         return 1;
