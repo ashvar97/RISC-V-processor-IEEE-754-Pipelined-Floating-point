@@ -1,4 +1,3 @@
-// Enhanced 4-Stage FPU Pipeline with Exception Handling and Denormalized Support
 #include <systemc.h>
 #include <cmath>
 #include <vector>
@@ -8,7 +7,6 @@
 #include <iostream>
 using namespace std;
 
-// Exception flags
 enum fp_exceptions {
     FP_INVALID_OP = 0x1,
     FP_OVERFLOW = 0x2,
@@ -17,7 +15,6 @@ enum fp_exceptions {
     FP_INEXACT = 0x10
 };
 
-// Helper functions
 sc_uint<32> float_to_ieee754(float f) {
     union { float f; uint32_t i; } u;
     u.f = f;
@@ -30,7 +27,6 @@ float ieee754_to_float(sc_uint<32> ieee) {
     return u.f;
 }
 
-// Enhanced IEEE 754 utilities
 struct ieee754_components {
     bool sign;
     sc_uint<8> exponent;
@@ -39,7 +35,7 @@ struct ieee754_components {
     bool is_infinity;
     bool is_nan;
     bool is_denormalized;
-    sc_uint<24> effective_mantissa; // With implicit bit handling
+    sc_uint<24> effective_mantissa;
 };
 
 ieee754_components decompose_ieee754(sc_uint<32> value) {
@@ -53,14 +49,11 @@ ieee754_components decompose_ieee754(sc_uint<32> value) {
     comp.is_nan = (comp.exponent == 0xFF) && (comp.mantissa != 0);
     comp.is_denormalized = (comp.exponent == 0) && (comp.mantissa != 0);
     
-    // Set effective mantissa with proper implicit bit handling
     if (comp.is_zero || comp.is_infinity || comp.is_nan) {
         comp.effective_mantissa = comp.mantissa;
     } else if (comp.is_denormalized) {
-        // Denormalized: no implicit leading 1, effective exponent is 1
         comp.effective_mantissa = comp.mantissa;
     } else {
-        // Normalized: add implicit leading 1
         comp.effective_mantissa = comp.mantissa | 0x800000;
     }
     
@@ -68,56 +61,44 @@ ieee754_components decompose_ieee754(sc_uint<32> value) {
 }
 
 sc_uint<32> compose_ieee754(bool sign, sc_int<12> exp_signed, sc_uint<24> mantissa, sc_uint<8>& exceptions) {
-    // Handle special cases first
     if (exp_signed >= 255) {
-        // Overflow - return infinity
         exceptions |= FP_OVERFLOW;
         return (sc_uint<32>(sign) << 31) | 0x7F800000;
     }
     
     if (exp_signed <= 0) {
-        // Check for denormalized numbers
         if (exp_signed >= -22 && mantissa != 0) {
-            // Can represent as denormalized
             exceptions |= FP_UNDERFLOW;
             
-            // Shift mantissa right by (1 - exp_signed) positions
             int shift_amount = 1 - exp_signed.to_int();
             if (shift_amount > 0 && shift_amount < 24) {
                 mantissa >>= shift_amount;
                 if (mantissa == 0) {
-                    // Underflow to zero
                     return (sc_uint<32>(sign) << 31);
                 }
-                // Return denormalized number (exponent = 0)
                 return (sc_uint<32>(sign) << 31) | (mantissa & 0x7FFFFF);
             }
         }
         
-        // Complete underflow - return zero
         exceptions |= FP_UNDERFLOW;
         return (sc_uint<32>(sign) << 31);
     }
     
-    // Normal case
     sc_uint<8> exp = sc_uint<8>(exp_signed);
     
-    // Remove implicit leading bit for normalized numbers
     sc_uint<23> frac = mantissa & 0x7FFFFF;
     
     return (sc_uint<32>(sign) << 31) | (sc_uint<32>(exp) << 23) | sc_uint<32>(frac);
 }
 
-// Generate special values
 sc_uint<32> generate_nan(bool sign = false) {
-    return (sc_uint<32>(sign) << 31) | 0x7FC00000; // Quiet NaN
+    return (sc_uint<32>(sign) << 31) | 0x7FC00000;
 }
 
 sc_uint<32> generate_infinity(bool sign = false) {
     return (sc_uint<32>(sign) << 31) | 0x7F800000;
 }
 
-// Instruction format: [31:28] opcode, [27:23] rd, [22:18] rs1, [17:13] rs2, [12:0] unused
 struct fp_instruction_t {
     sc_uint<4>  opcode;
     sc_uint<5>  rd;     
@@ -134,7 +115,6 @@ struct fp_instruction_t {
     }
 };
 
-// ========== FETCH STAGE ==========
 SC_MODULE(Fetch) {
     sc_in<bool> clk;
     sc_in<bool> reset;
@@ -175,18 +155,15 @@ SC_MODULE(Fetch) {
     }
 };
 
-// ========== DECODE STAGE ==========
 SC_MODULE(Decode) {
     sc_in<bool> clk;
     sc_in<bool> reset;
     sc_in<bool> stall;
     
-    // From Fetch
     sc_in<sc_uint<32>> pc_in;
     sc_in<sc_uint<32>> instruction_in;
     sc_in<bool> valid_in;
     
-    // To Execute
     sc_out<sc_uint<32>> pc_out;
     sc_out<sc_uint<4>> opcode_out;
     sc_out<sc_uint<5>> rd_out;
@@ -194,7 +171,6 @@ SC_MODULE(Decode) {
     sc_out<sc_uint<32>> operand2_out;
     sc_out<bool> valid_out;
     
-    // Register file and exception status
     sc_uint<32> fp_registers[32];
     sc_uint<8> exception_flags;
     
@@ -208,24 +184,20 @@ SC_MODULE(Decode) {
             valid_out.write(false);
             exception_flags = 0;
             
-            // Initialize registers to zero
             for (int i = 0; i < 32; i++) {
                 fp_registers[i] = 0;
             }
         } else if (!stall.read() && valid_in.read()) {
             sc_uint<32> inst = instruction_in.read();
             
-            // Decode instruction fields
             sc_uint<4> opcode = (inst >> 28) & 0xF;
             sc_uint<5> rd = (inst >> 23) & 0x1F;
             sc_uint<5> rs1 = (inst >> 18) & 0x1F;
             sc_uint<5> rs2 = (inst >> 13) & 0x1F;
             
-            // Read operands from register file
             sc_uint<32> op1 = fp_registers[rs1.to_uint()];
             sc_uint<32> op2 = fp_registers[rs2.to_uint()];
             
-            // Forward to Execute stage
             pc_out.write(pc_in.read());
             opcode_out.write(opcode);
             rd_out.write(rd);
@@ -267,13 +239,11 @@ SC_MODULE(Decode) {
     }
 };
 
-// ========== ENHANCED EXECUTE STAGE ==========
 SC_MODULE(Execute) {
     sc_in<bool> clk;
     sc_in<bool> reset;
     sc_in<bool> stall;
     
-    // Input from Decode stage
     sc_in<sc_uint<32>> pc_in;
     sc_in<sc_uint<4>> opcode_in;
     sc_in<sc_uint<5>> rd_in;
@@ -281,7 +251,6 @@ SC_MODULE(Execute) {
     sc_in<sc_uint<32>> operand2_in;
     sc_in<bool> valid_in;
     
-    // Output to Writeback stage
     sc_out<sc_uint<32>> pc_out;
     sc_out<sc_uint<4>> opcode_out;
     sc_out<sc_uint<5>> rd_out;
@@ -305,10 +274,8 @@ private:
         sc_uint<32> operand_b;
         bool valid;
         
-        // Decomposed operands
         ieee754_components comp_a, comp_b;
         
-        // Division-specific fields
         bool is_division;
         int div_cycles_remaining;
         sc_uint<48> div_dividend;
@@ -317,7 +284,6 @@ private:
         bool div_sign;
         sc_int<12> div_exp;
         
-        // Result and exceptions
         sc_uint<32> result;
         sc_uint<8> exceptions;
         
@@ -343,11 +309,8 @@ private:
     enhanced_pipeline_stage pipe[3];
     vector<enhanced_pipeline_stage> division_buffer;
     
-    // Enhanced arithmetic operations with exception handling
-// Fixed addition/subtraction function for the FPU pipeline
 sc_uint<32> perform_addition(const ieee754_components& a, const ieee754_components& b, 
                             bool subtract, sc_uint<8>& exceptions) {
-    // Handle special cases first
     if (a.is_nan || b.is_nan) {
         exceptions |= FP_INVALID_OP;
         return generate_nan();
@@ -378,60 +341,53 @@ sc_uint<32> perform_addition(const ieee754_components& a, const ieee754_componen
         return (sc_uint<32>(a.sign) << 31) | (sc_uint<32>(a.exponent) << 23) | a.mantissa;
     }
     
-    // Extract exponents - FIXED: Use actual exponents, not effective
     sc_int<12> exp_a, exp_b;
     sc_uint<24> mant_a, mant_b;
     
     if (a.is_denormalized) {
-        exp_a = sc_int<12>(1);  // Effective exponent for denormalized
-        mant_a = a.mantissa;    // No implicit bit
+        exp_a = sc_int<12>(1);
+        mant_a = a.mantissa;
     } else {
         exp_a = sc_int<12>(a.exponent);
-        mant_a = a.mantissa | 0x800000;  // Add implicit bit
+        mant_a = a.mantissa | 0x800000;
     }
     
     if (b.is_denormalized) {
-        exp_b = sc_int<12>(1);  // Effective exponent for denormalized
-        mant_b = b.mantissa;    // No implicit bit
+        exp_b = sc_int<12>(1);
+        mant_b = b.mantissa;
     } else {
         exp_b = sc_int<12>(b.exponent);
-        mant_b = b.mantissa | 0x800000;  // Add implicit bit
+        mant_b = b.mantissa | 0x800000;
     }
     
-    // FIXED: Determine larger operand and align mantissas properly
     sc_int<12> exp_diff = exp_a - exp_b;
     sc_int<12> result_exp;
     
     if (exp_diff >= 0) {
-        // exp_a >= exp_b, so use exp_a as result exponent
         result_exp = exp_a;
         if (exp_diff.to_int() > 0 && exp_diff.to_int() < 24) {
             mant_b >>= exp_diff.to_int();
         } else if (exp_diff.to_int() >= 24) {
-            mant_b = 0;  // Complete loss of precision
+            mant_b = 0;
         }
     } else {
-        // exp_b > exp_a, so use exp_b as result exponent
         result_exp = exp_b;
         int shift_amount = -exp_diff.to_int();
         if (shift_amount > 0 && shift_amount < 24) {
             mant_a >>= shift_amount;
         } else if (shift_amount >= 24) {
-            mant_a = 0;  // Complete loss of precision
+            mant_a = 0;
         }
     }
     
-    // FIXED: Perform addition/subtraction with proper sign handling
     sc_uint<25> result_mant;
     bool result_sign;
     bool b_sign_eff = subtract ? !b.sign : b.sign;
     
     if (a.sign == b_sign_eff) {
-        // Same effective signs: add magnitudes
         result_mant = sc_uint<25>(mant_a) + sc_uint<25>(mant_b);
         result_sign = a.sign;
     } else {
-        // Different effective signs: subtract magnitudes
         if (mant_a >= mant_b) {
             result_mant = sc_uint<25>(mant_a) - sc_uint<25>(mant_b);
             result_sign = a.sign;
@@ -441,31 +397,25 @@ sc_uint<32> perform_addition(const ieee754_components& a, const ieee754_componen
         }
     }
     
-    // Handle zero result
     if (result_mant == 0) {
         return 0;
     }
     
-    // FIXED: Normalize result properly
     if (result_mant & 0x1000000) {
-        // Carry out - shift right and increment exponent
         result_mant >>= 1;
         result_exp++;
     } else {
-        // FIXED: Normalize left - find leading 1
         while (result_mant != 0 && !(result_mant & 0x800000) && result_exp > 1) {
             result_mant <<= 1;
             result_exp--;
         }
     }
     
-    // FIXED: Remove implicit bit before packing
-    sc_uint<24> final_mantissa = result_mant & 0x7FFFFF;  // Keep only fractional part
+    sc_uint<24> final_mantissa = result_mant & 0x7FFFFF;
     
     return compose_ieee754(result_sign, result_exp, final_mantissa, exceptions);
 }
 
-// ADDITIONAL FIX: Updated effective_mantissa calculation in decompose_ieee754
 ieee754_components decompose_ieee754(sc_uint<32> value) {
     ieee754_components comp;
     comp.sign = value[31];
@@ -477,14 +427,11 @@ ieee754_components decompose_ieee754(sc_uint<32> value) {
     comp.is_nan = (comp.exponent == 0xFF) && (comp.mantissa != 0);
     comp.is_denormalized = (comp.exponent == 0) && (comp.mantissa != 0);
     
-    // FIXED: Set effective mantissa with proper bit width
     if (comp.is_zero || comp.is_infinity || comp.is_nan) {
         comp.effective_mantissa = comp.mantissa;
     } else if (comp.is_denormalized) {
-        // Denormalized: no implicit leading 1
         comp.effective_mantissa = comp.mantissa;
     } else {
-        // Normalized: add implicit leading 1
         comp.effective_mantissa = comp.mantissa | 0x800000;
     }
     
@@ -493,7 +440,6 @@ ieee754_components decompose_ieee754(sc_uint<32> value) {
     
     sc_uint<32> perform_multiplication(const ieee754_components& a, const ieee754_components& b, 
                                      sc_uint<8>& exceptions) {
-        // Handle special cases
         if (a.is_nan || b.is_nan) {
             exceptions |= FP_INVALID_OP;
             return generate_nan();
@@ -514,21 +460,16 @@ ieee754_components decompose_ieee754(sc_uint<32> value) {
         
         bool result_sign = a.sign ^ b.sign;
         
-        // Calculate exponent (handle denormalized)
         sc_int<12> exp_a = a.is_denormalized ? sc_int<12>(1) : sc_int<12>(a.exponent);
         sc_int<12> exp_b = b.is_denormalized ? sc_int<12>(1) : sc_int<12>(b.exponent);
         sc_int<12> result_exp = exp_a + exp_b - 127;
         
-        // Multiply mantissas
         sc_uint<48> product = sc_uint<48>(a.effective_mantissa) * sc_uint<48>(b.effective_mantissa);
         
-        // Normalize product
         if (product & 0x800000000000ULL) {
-            // Product >= 2.0, shift right
             product >>= 24;
             result_exp++;
         } else {
-            // Product < 2.0, shift right by 23
             product >>= 23;
         }
         
@@ -541,7 +482,6 @@ ieee754_components decompose_ieee754(sc_uint<32> value) {
         ieee754_components& a = stage.comp_a;
         ieee754_components& b = stage.comp_b;
         
-        // Handle special cases
         if (a.is_nan || b.is_nan) {
             stage.exceptions |= FP_INVALID_OP;
             stage.result = generate_nan();
@@ -584,10 +524,8 @@ ieee754_components decompose_ieee754(sc_uint<32> value) {
             return;
         }
         
-        // Normal division setup
         stage.div_sign = a.sign ^ b.sign;
         
-        // Handle denormalized operands
         sc_int<12> exp_a = a.is_denormalized ? sc_int<12>(1) : sc_int<12>(a.exponent);
         sc_int<12> exp_b = b.is_denormalized ? sc_int<12>(1) : sc_int<12>(b.exponent);
         stage.div_exp = exp_a - exp_b + 127;
@@ -601,7 +539,6 @@ ieee754_components decompose_ieee754(sc_uint<32> value) {
     void perform_division_step(enhanced_pipeline_stage& stage) {
         if (stage.div_cycles_remaining <= 0) return;
         
-        // Restoring division algorithm
         stage.div_dividend <<= 1;
         
         sc_uint<48> divisor_shifted = sc_uint<48>(stage.div_divisor) << 24;
@@ -616,12 +553,10 @@ ieee754_components decompose_ieee754(sc_uint<32> value) {
         stage.div_cycles_remaining--;
         
         if (stage.div_cycles_remaining == 0) {
-            // Normalize and pack result
             sc_uint<24> quotient = stage.div_quotient;
             sc_int<12> exp = stage.div_exp;
             
             if (quotient != 0) {
-                // Normalize quotient
                 while (quotient != 0 && !(quotient & 0x800000) && exp > 1) {
                     quotient <<= 1;
                     exp--;
@@ -642,7 +577,7 @@ ieee754_components decompose_ieee754(sc_uint<32> value) {
             case OP_FMUL:
                 return perform_multiplication(a, b, exceptions);
             case OP_FDIV:
-                return 0; // Handled separately
+                return 0;
             default:
                 exceptions |= FP_INVALID_OP;
                 return generate_nan();
@@ -666,17 +601,14 @@ public:
             
         } else if (!stall.read()) {
             
-            // Process division buffer
             for (auto& div_op : division_buffer) {
                 if (div_op.valid && div_op.div_cycles_remaining > 0) {
                     perform_division_step(div_op);
                 }
             }
             
-            // Stage 3: Output
             bool output_produced = false;
             
-            // Check for completed divisions
             for (int i = 0; i < division_buffer.size(); i++) {
                 if (division_buffer[i].valid && division_buffer[i].div_cycles_remaining == 0) {
                     pc_out.write(division_buffer[i].pc);
@@ -692,7 +624,6 @@ public:
                 }
             }
             
-            // Output regular operations
             if (!output_produced && pipe[2].valid) {
                 pc_out.write(pipe[2].pc);
                 opcode_out.write(pipe[2].opcode);
@@ -704,7 +635,6 @@ public:
                 valid_out.write(false);
             }
             
-            // Stage 2: Compute
             if (pipe[1].valid) {
                 pipe[2] = pipe[1];
                 
@@ -725,7 +655,6 @@ public:
                 pipe[2].valid = false;
             }
             
-            // Stage 1: Extract and analyze
             if (pipe[0].valid) {
                 pipe[1] = pipe[0];
                 pipe[1].comp_a = decompose_ieee754(pipe[0].operand_a);
@@ -735,7 +664,6 @@ public:
                 pipe[1].valid = false;
             }
             
-            // Stage 0: Input
             if (valid_in.read()) {
                 pipe[0].pc = pc_in.read();
                 pipe[0].opcode = opcode_in.read();
@@ -748,7 +676,6 @@ public:
             }
             
         } else {
-            // Stalled - continue division processing only
             for (auto& div_op : division_buffer) {
                 if (div_op.valid && div_op.div_cycles_remaining > 0) {
                     perform_division_step(div_op);
@@ -770,13 +697,11 @@ public:
     }
 };
 
-// ========== WRITEBACK STAGE ==========
 SC_MODULE(Writeback) {
     sc_in<bool> clk;
     sc_in<bool> reset;
     sc_in<bool> stall;
     
-    // From Execute
     sc_in<sc_uint<32>> pc_in;
     sc_in<sc_uint<4>> opcode_in;
     sc_in<sc_uint<5>> rd_in;
@@ -788,7 +713,6 @@ SC_MODULE(Writeback) {
     
     void writeback_process() {
         if (reset.read()) {
-            // Clear exception flags on reset
             if (decode_stage) {
                 decode_stage->clear_exception_flags();
             }
@@ -797,11 +721,9 @@ SC_MODULE(Writeback) {
             sc_uint<32> result = result_in.read();
             sc_uint<8> exceptions = exceptions_in.read();
             
-            // Write result back to register file
             if (decode_stage) {
                 decode_stage->write_register(rd, result);
                 
-                // Update exception flags
                 if (exceptions != 0) {
                     decode_stage->set_exception_flag(exceptions);
                 }
@@ -819,18 +741,15 @@ SC_MODULE(Writeback) {
     }
 };
 
-// ========== COMPREHENSIVE TESTBENCH ==========
 SC_MODULE(ComprehensiveTestbench) {
     sc_clock clk;
     sc_signal<bool> reset, stall;
     
-    // Pipeline stage instances
     Fetch *fetch_stage;
     Decode *decode_stage;
     Execute *execute_stage;
     Writeback *writeback_stage;
     
-    // Inter-stage signals
     sc_signal<sc_uint<32>> fetch_pc, fetch_inst;
     sc_signal<bool> fetch_valid;
     
@@ -852,21 +771,16 @@ SC_MODULE(ComprehensiveTestbench) {
     void create_comprehensive_test_program() {
         vector<sc_uint<32>> program;
         
-        // Basic operations
-        fp_instruction_t inst1(0x0, 3, 1, 2);   // FADD f3, f1, f2  (3.0 + 2.0 = 5.0)
-        fp_instruction_t inst2(0x1, 4, 1, 2);   // FSUB f4, f1, f2  (3.0 - 2.0 = 1.0)
-        fp_instruction_t inst3(0x2, 5, 1, 2);   // FMUL f5, f1, f2  (3.0 * 2.0 = 6.0)
-        fp_instruction_t inst4(0x3, 6, 1, 2);   // FDIV f6, f1, f2  (3.0 / 2.0 = 1.5)
-        
-        // Exception tests
-        fp_instruction_t inst5(0x3, 7, 1, 8);   // FDIV f7, f1, f8  (3.0 / 0.0 = inf)
-        fp_instruction_t inst6(0x0, 9, 10, 11); // FADD f9, f10, f11 (inf + (-inf) = NaN)
-        fp_instruction_t inst7(0x2, 12, 13, 14); // FMUL f12, f13, f14 (very_small * very_small = underflow)
-        fp_instruction_t inst8(0x2, 15, 16, 17); // FMUL f15, f16, f17 (very_large * very_large = overflow)
-        
-        // Denormalized number tests
-        fp_instruction_t inst9(0x0, 18, 19, 20);  // FADD with denormalized
-        fp_instruction_t inst10(0x2, 21, 22, 23); // FMUL with denormalized
+        fp_instruction_t inst1(0x0, 3, 1, 2);
+        fp_instruction_t inst2(0x1, 4, 1, 2);
+        fp_instruction_t inst3(0x2, 5, 1, 2);
+        fp_instruction_t inst4(0x3, 6, 1, 2);
+        fp_instruction_t inst5(0x3, 7, 1, 8);
+        fp_instruction_t inst6(0x0, 9, 10, 11);
+        fp_instruction_t inst7(0x2, 12, 13, 14);
+        fp_instruction_t inst8(0x2, 15, 16, 17);
+        fp_instruction_t inst9(0x0, 18, 19, 20);
+        fp_instruction_t inst10(0x2, 21, 22, 23);
         
         program.push_back(inst1.to_word());
         program.push_back(inst2.to_word());
@@ -883,28 +797,23 @@ SC_MODULE(ComprehensiveTestbench) {
     }
     
     void setup_test_registers() {
-        // Basic test values
         decode_stage->set_register(1, 3.0f);
         decode_stage->set_register(2, 2.0f);
         
-        // Exception test values
-        decode_stage->fp_registers[8] = 0;  // Zero for division by zero test
-        decode_stage->fp_registers[10] = 0x7F800000;  // +infinity
-        decode_stage->fp_registers[11] = 0xFF800000;  // -infinity
+        decode_stage->fp_registers[8] = 0;
+        decode_stage->fp_registers[10] = 0x7F800000;
+        decode_stage->fp_registers[11] = 0xFF800000;
         
-        // Overflow test (very large numbers)
-        decode_stage->fp_registers[16] = 0x7F000000;  // Large positive
-        decode_stage->fp_registers[17] = 0x7F000000;  // Large positive
+        decode_stage->fp_registers[16] = 0x7F000000;
+        decode_stage->fp_registers[17] = 0x7F000000;
         
-        // Underflow test (very small numbers)
-        decode_stage->fp_registers[13] = 0x00800000;  // Smallest normalized positive
-        decode_stage->fp_registers[14] = 0x00800000;  // Smallest normalized positive
+        decode_stage->fp_registers[13] = 0x00800000;
+        decode_stage->fp_registers[14] = 0x00800000;
         
-        // Denormalized numbers
-        decode_stage->fp_registers[19] = 0x00400000;  // Denormalized positive
-        decode_stage->fp_registers[20] = 0x00200000;  // Denormalized positive
-        decode_stage->fp_registers[22] = 0x00100000;  // Denormalized positive
-        decode_stage->fp_registers[23] = 0x3F800000;  // 1.0 (normalized)
+        decode_stage->fp_registers[19] = 0x00400000;
+        decode_stage->fp_registers[20] = 0x00200000;
+        decode_stage->fp_registers[22] = 0x00100000;
+        decode_stage->fp_registers[23] = 0x3F800000;
         
         cout << "\nTest register setup:" << endl;
         cout << "Basic: f1=3.0, f2=2.0" << endl;
